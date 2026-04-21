@@ -11,7 +11,7 @@ set -uo pipefail
 IFS=$'\n\t'
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TOOL_VERSION="1.1"
+TOOL_VERSION="1.2"
 TOOL_NAME="ZLT"
 HOSTNAME_VAL=$(hostname 2>/dev/null || echo "unknown")
 START_TS=$(date '+%Y-%m-%d %H:%M:%S')
@@ -19,40 +19,66 @@ START_EPOCH=$(date +%s)
 
 # Resolve script directory (works with symlinks, relative paths, direct execution)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPORT_BASE="${SCRIPT_DIR}/ZLT_${HOSTNAME_VAL}_$(date +%Y%m%d_%H%M%S)"
+_TS_SUFFIX="${HOSTNAME_VAL}_$(date +%Y%m%d_%H%M%S)"
+REPORT_BASE="${SCRIPT_DIR}/ZLT_${_TS_SUFFIX}"
 REPORT_FILE="${REPORT_BASE}.html"
+
+# Triage directory — raw text artefacts, one sub-dir per module
+TRIAGE_DIR="${REPORT_BASE}_triage"
 
 # ── Export flags (CLI args) ───────────────────────────────────────────────────
 EXPORT_CSV=0
 EXPORT_JSON=0
+EXPORT_TXT=0          # always created; --all also packs it into an archive
+EXPORT_ARCHIVE=0
 for _arg in "$@"; do
     case "$_arg" in
         --csv)  EXPORT_CSV=1  ;;
         --json) EXPORT_JSON=1 ;;
-        --all)  EXPORT_CSV=1; EXPORT_JSON=1 ;;
+        --txt)  EXPORT_TXT=1  ;;
+        --all)  EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1; EXPORT_ARCHIVE=1 ;;
         --help|-help|-h)
             echo ""
-            echo "  ZLT v1.1 — ZavetSec Linux Triage"
+            echo "  ZLT v1.2 — ZavetSec Linux Triage"
             echo ""
             echo "  Usage: $0 [OPTIONS]"
             echo ""
             echo "  Options:"
             echo "    --csv      Export findings to CSV alongside HTML report"
             echo "    --json     Export findings to JSON alongside HTML report"
-            echo "    --all      Export both CSV and JSON"
+            echo "    --txt      Save raw triage data as text files (module sub-dirs)"
+            echo "    --all      CSV + JSON + TXT + tar.gz archive of everything"
             echo "    --help     Show this help message"
             echo ""
-            echo "  Output files are saved in the same directory as the script."
+            echo "  Output is saved in the same directory as the script."
+            echo "  --all creates: .html  .csv  .json  _triage/  .tar.gz"
             echo ""
             echo "  Examples:"
             echo "    sudo ./ZLT.sh                  # HTML report only"
             echo "    sudo ./ZLT.sh --csv            # HTML + CSV"
-            echo "    sudo ./ZLT.sh --json           # HTML + JSON"
-            echo "    sudo ./ZLT.sh --all            # HTML + CSV + JSON"
+            echo "    sudo ./ZLT.sh --txt            # HTML + triage folder"
+            echo "    sudo ./ZLT.sh --all            # everything + archive"
             echo ""
             exit 0 ;;
     esac
 done
+
+# ── Create triage directory if TXT or ARCHIVE export requested ────────────────
+_triage_write() {
+    # _triage_write <subdir> <filename> <content>
+    # Writes a text artefact only when EXPORT_TXT=1 or EXPORT_ARCHIVE=1
+    [[ "$EXPORT_TXT" -eq 0 && "$EXPORT_ARCHIVE" -eq 0 ]] && return 0
+    local subdir="$1" fname="$2"
+    shift 2
+    local dir="${TRIAGE_DIR}/${subdir}"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '%s
+' "$*" > "${dir}/${fname}" 2>/dev/null || true
+}
+
+if [[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]]; then
+    mkdir -p "$TRIAGE_DIR" 2>/dev/null || true
+fi
 
 # Colors for terminal
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -120,7 +146,7 @@ cat << 'BANNER'
   / /__| (_| |\ V /  __/| |_ ____) |  __/ (__ 
  /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
                                                 
- ZLT v1.1 | ZavetSec Linux Triage | DFIR Telemetry + Detection
+ ZLT v1.2 | ZavetSec Linux Triage | DFIR Telemetry + Detection
 BANNER
 echo -e "${NC}"
 
@@ -153,6 +179,14 @@ if [[ "$KERNEL_MAJOR" -lt 4 ]] || [[ "$KERNEL_MAJOR" -eq 4 && "$KERNEL_MINOR" -l
     add_finding "MEDIUM" "Initial Access" "SYS-001" "Outdated Linux kernel" \
         "Kernel $(uname -r) may contain known vulnerabilities. Upgrade recommended."
 fi
+
+# ── Triage: sysinfo ──────────────────────────────────────────────────────────
+_triage_write "01_sysinfo" "os_release.txt"  "$(safe_run cat /etc/os-release 2>/dev/null)"
+_triage_write "01_sysinfo" "uname.txt"       "$(uname -a)"
+_triage_write "01_sysinfo" "uptime.txt"      "$(safe_run uptime 2>/dev/null)"
+_triage_write "01_sysinfo" "hostname.txt"    "$(hostname -f 2>/dev/null || hostname)"
+_triage_write "01_sysinfo" "date_utc.txt"    "$(date -u)"
+_triage_write "01_sysinfo" "timezone.txt"    "$(safe_run cat /etc/timezone 2>/dev/null || timedatectl 2>/dev/null)"
 
 # =============================================================================
 # MODULE 2: Users & Accounts
@@ -212,6 +246,16 @@ if [[ "$IS_ROOT" -eq 1 ]]; then
     fi
 fi
 
+# ── Triage: users ────────────────────────────────────────────────────────────
+_triage_write "02_users" "passwd_shells.txt"  "$M_USERS_SHELL"
+_triage_write "02_users" "uid0.txt"           "$M_UID0"
+_triage_write "02_users" "sudoers_groups.txt" "$M_SUDOERS"
+_triage_write "02_users" "passwd_full.txt"    "$(safe_run cat /etc/passwd 2>/dev/null)"
+_triage_write "02_users" "group.txt"          "$(safe_run cat /etc/group 2>/dev/null)"
+if [[ "$IS_ROOT" -eq 1 ]]; then
+    _triage_write "02_users" "lastlog.txt" "$(safe_run lastlog 2>/dev/null | head -50)"
+fi
+
 # =============================================================================
 # MODULE 3: Network Connections
 # =============================================================================
@@ -254,6 +298,13 @@ if [[ -n "$EXTERNAL_CONNS" ]]; then
         "$(echo "$EXTERNAL_CONNS" | head -5 | tr '\n' '; ')"
 fi
 
+# ── Triage: network ──────────────────────────────────────────────────────────
+_triage_write "03_network" "ss_listening.txt"    "$M_NETSTAT"
+_triage_write "03_network" "ss_established.txt"  "$M_ESTABLISHED"
+_triage_write "03_network" "interfaces.txt"      "$M_INTERFACES"
+_triage_write "03_network" "routes.txt"          "$M_ROUTES"
+_triage_write "03_network" "arp.txt"             "$M_ARP"
+
 # =============================================================================
 # MODULE 4: Running Processes
 # =============================================================================
@@ -295,6 +346,11 @@ if [[ -n "$HIGH_CPU" ]]; then
         "Process with abnormally high CPU usage (>80%)" \
         "$(echo "$HIGH_CPU" | head -3 | tr '\n' '; ')"
 fi
+
+# ── Triage: processes ────────────────────────────────────────────────────────
+_triage_write "04_processes" "ps_auxf.txt"   "$M_PROCESSES"
+_triage_write "04_processes" "pstree.txt"    "$M_PROC_TREE"
+_triage_write "04_processes" "fds_open.txt"  "$(safe_run ls -la /proc/*/fd 2>/dev/null | grep -v '^total' | head -100)"
 
 # =============================================================================
 # PROC-005: Processes whose binary is NOT owned by any installed package
@@ -449,6 +505,17 @@ if [[ -n "$SUSP_RC" ]]; then
         "$(echo "$SUSP_RC" | head -5 | tr '\n' '; ')"
 fi
 
+# ── Triage: persistence ──────────────────────────────────────────────────────
+_triage_write "05_persistence" "crontab_root.txt"   "$M_CRONTAB_ROOT"
+_triage_write "05_persistence" "cron_etc.txt"       "$M_CRON_ETC"
+_triage_write "05_persistence" "cron_content.txt"   "$M_CRON_CONTENT"
+_triage_write "05_persistence" "systemd_running.txt" "$M_SYSTEMD_UNITS"
+_triage_write "05_persistence" "systemd_enabled.txt" "$M_SYSTEMD_ENABLED"
+_triage_write "05_persistence" "profile_d.txt"      "$M_PROFILE_D"
+_triage_write "05_persistence" "bashrc_root.txt"    "$M_BASHRC"
+_triage_write "05_persistence" "ssh_authorized_keys.txt" "$M_SSH_KEYS"
+_triage_write "05_persistence" "at_jobs.txt"        "$(safe_run atq 2>/dev/null || echo 'N/A')"
+
 # =============================================================================
 # MODULE 6: File System Anomalies
 # =============================================================================
@@ -533,6 +600,14 @@ if [[ -n "$HIDDEN_SUSP" ]]; then
         "$(echo "$HIDDEN_SUSP" | head -10 | tr '\n' '; ')"
 fi
 
+# ── Triage: filesystem ───────────────────────────────────────────────────────
+_triage_write "06_filesystem" "suid_binaries.txt"       "$M_SUID"
+_triage_write "06_filesystem" "sgid_binaries.txt"       "$M_SGID"
+_triage_write "06_filesystem" "world_writable_dirs.txt" "$M_WORLD_WRITE"
+_triage_write "06_filesystem" "recently_modified.txt"   "$M_RECENT_FILES"
+_triage_write "06_filesystem" "tmp_files.txt"           "$M_TMP_FILES"
+_triage_write "06_filesystem" "hidden_suspicious.txt"   "$HIDDEN_SUSP"
+
 # =============================================================================
 # MODULE 7: Log Analysis
 # =============================================================================
@@ -611,6 +686,14 @@ if [[ -n "$SUDO_ROOT" ]]; then
         "$(echo "$SUDO_ROOT" | head -5 | tr '\n' '; ')"
 fi
 
+# ── Triage: logs ─────────────────────────────────────────────────────────────
+_triage_write "07_logs" "auth_log.txt"      "$M_AUTH_TAIL"
+_triage_write "07_logs" "failed_logins.txt" "$FAILED_LOGINS"
+_triage_write "07_logs" "success_logins.txt" "$SUCCESS_LOGINS"
+_triage_write "07_logs" "last_wtmp.txt"     "$M_LAST_LOGINS"
+_triage_write "07_logs" "syslog.txt"        "$M_SYSLOG"
+_triage_write "07_logs" "dmesg.txt"         "$(safe_run dmesg 2>/dev/null | tail -100)"
+
 # =============================================================================
 # MODULE 8: Network Config & Firewall
 # =============================================================================
@@ -639,6 +722,13 @@ if echo "$RESOLV_NS" | grep -vqE '8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1|1\.0\.0\.1|9\
         "Non-standard DNS server in resolv.conf" \
         "Nameservers: ${RESOLV_NS}"
 fi
+
+# ── Triage: network config ───────────────────────────────────────────────────
+_triage_write "08_netconfig" "iptables.txt"   "$M_IPTABLES"
+_triage_write "08_netconfig" "ufw.txt"        "$M_UFW"
+_triage_write "08_netconfig" "hosts.txt"      "$M_HOSTS"
+_triage_write "08_netconfig" "resolv_conf.txt" "$M_RESOLV"
+_triage_write "08_netconfig" "arp_table.txt"  "$M_ARP"
 
 # =============================================================================
 # MODULE 9: Installed Software & Packages
@@ -673,6 +763,10 @@ elif [[ -r /var/log/rpm/history.log ]]; then
 fi
 M_RECENT_PKG="${RECENT_PKG:-N/A}"
 
+# ── Triage: packages ─────────────────────────────────────────────────────────
+_triage_write "09_packages" "installed_packages.txt" "$M_PACKAGES"
+_triage_write "09_packages" "recent_packages.txt"    "$M_RECENT_PKG"
+
 # =============================================================================
 # MODULE 10: Kernel Modules
 # =============================================================================
@@ -697,6 +791,11 @@ if [[ "$IS_ROOT" -eq 1 ]]; then
             "$(echo "$NONSTAND_MODS" | head -5 | tr '\n' '; ')"
     fi
 fi
+
+# ── Triage: kernel ───────────────────────────────────────────────────────────
+_triage_write "10_kernel" "lsmod.txt"         "$M_LSMOD"
+_triage_write "10_kernel" "kernel_version.txt" "$(uname -a)"
+_triage_write "10_kernel" "cmdline.txt"       "$(safe_run cat /proc/cmdline 2>/dev/null)"
 
 # =============================================================================
 # MODULE 11: Environment & Shell History
@@ -772,6 +871,12 @@ if [[ "$ROOT_HIST_LEN" -lt 5 && "$IS_ROOT" -eq 1 ]]; then
         "Shell: ${ROOT_SHELL_NAME}, file: ${ROOT_HIST_FILE}, lines: ${ROOT_HIST_LEN}"
 fi
 
+# ── Triage: environment & history ────────────────────────────────────────────
+_triage_write "11_env_history" "environment.txt"      "$M_ENV"
+_triage_write "11_env_history" "root_history.txt"     "$M_BASH_HISTORY_ROOT"
+_triage_write "11_env_history" "user_histories.txt"   "$M_BASH_HISTORY_USERS"
+_triage_write "11_env_history" "suspicious_cmds.txt"  "$SUSP_HIST"
+
 # =============================================================================
 # MODULE 12: Container / Cloud Metadata
 # =============================================================================
@@ -841,6 +946,11 @@ else
     M_CONTAINER="${M_CONTAINER}
 Virtualisation: ${VIRT_TYPE}"
 fi
+
+# ── Triage: container / cloud ────────────────────────────────────────────────
+_triage_write "12_container" "container_context.txt" "$M_CONTAINER"
+_triage_write "12_container" "cgroup.txt"    "$(safe_run cat /proc/1/cgroup 2>/dev/null)"
+_triage_write "12_container" "virt_type.txt" "$VIRT_TYPE"
 
 # =============================================================================
 # BUILD HTML REPORT
@@ -1454,6 +1564,46 @@ if [[ "$EXPORT_JSON" -eq 1 ]]; then
     log_ok "JSON exported: ${JSON_FILE}"
 fi
 
+# ── Optional: TXT triage folder notification ──────────────────────────────────
+if [[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]]; then
+    # Write findings summary into triage dir
+    {
+        printf 'ZLT Triage Summary\n'
+        printf 'Host: %s\n' "$HOSTNAME_VAL"
+        printf 'Date: %s\n' "$END_TS"
+        printf 'Duration: %ss\n' "$DURATION"
+        printf '\nFindings:\n'
+        printf '  CRITICAL: %d\n' "$FINDINGS_CRITICAL"
+        printf '  HIGH:     %d\n' "$FINDINGS_HIGH"
+        printf '  MEDIUM:   %d\n' "$FINDINGS_MEDIUM"
+        printf '  LOW:      %d\n' "$FINDINGS_LOW"
+        printf '  INFO:     %d\n' "$FINDINGS_INFO"
+        printf '\nDetail:\n'
+        for _entry in "${FINDINGS_ARR[@]+"${FINDINGS_ARR[@]}"}"; do
+            IFS=$'\x1f' read -r _sev _tactic _rule _title _detail <<< "$_entry"
+            printf '[%s] %s | %s | %s\n' "$_sev" "$_rule" "$_title" "$_detail"
+        done
+    } > "${TRIAGE_DIR}/findings_summary.txt" 2>/dev/null || true
+    log_ok "Triage folder: ${TRIAGE_DIR}/"
+fi
+
+# ── Optional: Archive (--all) ─────────────────────────────────────────────────
+if [[ "$EXPORT_ARCHIVE" -eq 1 ]]; then
+    ARCHIVE_FILE="${REPORT_BASE}.tar.gz"
+    _archive_files=()
+    [[ -f "${REPORT_FILE}" ]]       && _archive_files+=("$(basename "${REPORT_FILE}")")
+    [[ -f "${REPORT_BASE}.csv" ]]   && _archive_files+=("$(basename "${REPORT_BASE}.csv")")
+    [[ -f "${REPORT_BASE}.json" ]]  && _archive_files+=("$(basename "${REPORT_BASE}.json")")
+    [[ -d "${TRIAGE_DIR}" ]]        && _archive_files+=("$(basename "${TRIAGE_DIR}")")
+    if [[ "${#_archive_files[@]}" -gt 0 ]]; then
+        (cd "$SCRIPT_DIR" && tar -czf "$(basename "${ARCHIVE_FILE}")" "${_archive_files[@]}" 2>/dev/null)
+        if [[ -f "$ARCHIVE_FILE" ]]; then
+            _arch_size=$(du -sh "$ARCHIVE_FILE" 2>/dev/null | cut -f1 || echo "?")
+            log_ok "Archive created: ${ARCHIVE_FILE} (${_arch_size})"
+        fi
+    fi
+fi
+
 echo ""
 log_ok "Collection complete!"
 echo ""
@@ -1464,9 +1614,11 @@ echo -e "  ${BOLD}Findings:${NC}"
 [[ "$FINDINGS_LOW"      -gt 0 ]] && echo -e "    ${CYAN}  LOW:      ${FINDINGS_LOW}${NC}"
 [[ "$FINDINGS_INFO"     -gt 0 ]] && echo -e "    ${NC}  INFO:     ${FINDINGS_INFO}${NC}"
 echo ""
-echo -e "  ${BOLD}Report:${NC} ${GREEN}${REPORT_FILE}${NC}"
-[[ "$EXPORT_CSV"  -eq 1 ]] && echo -e "  ${BOLD}CSV:${NC}    ${GREEN}${REPORT_BASE}.csv${NC}"
-[[ "$EXPORT_JSON" -eq 1 ]] && echo -e "  ${BOLD}JSON:${NC}   ${GREEN}${REPORT_BASE}.json${NC}"
+echo -e "  ${BOLD}Report:${NC}   ${GREEN}${REPORT_FILE}${NC}"
+[[ "$EXPORT_CSV"     -eq 1 ]] && echo -e "  ${BOLD}CSV:${NC}      ${GREEN}${REPORT_BASE}.csv${NC}"
+[[ "$EXPORT_JSON"    -eq 1 ]] && echo -e "  ${BOLD}JSON:${NC}     ${GREEN}${REPORT_BASE}.json${NC}"
+[[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]] && echo -e "  ${BOLD}Triage:${NC}   ${GREEN}${TRIAGE_DIR}/${NC}"
+[[ "$EXPORT_ARCHIVE" -eq 1 ]] && echo -e "  ${BOLD}Archive:${NC}  ${GREEN}${REPORT_BASE}.tar.gz${NC}"
 echo ""
 echo -e "  ${BOLD}Open:${NC}"
 echo -e "    xdg-open ${REPORT_FILE}"
