@@ -193,7 +193,11 @@ if [[ -n "$WIDE_OPEN" ]]; then
 fi
 
 # Detection: unusual high ports listening
-HIGH_PORTS=$(echo "$M_NETSTAT" | grep -E ':([4-9][0-9]{4}|[1-9][0-9]{4})' | grep '0\.0\.0\.0\|:::' || true)
+# Exclude known desktop service ports: KDE Connect (1716), mDNS (5353), NTP (123),
+# Avahi (5353), and common ephemeral KDE/GNOME service ports
+HIGH_PORTS=$(echo "$M_NETSTAT" | grep -E ':([4-9][0-9]{4}|[1-9][0-9]{4})' | grep '0\.0\.0\.0\|:::' | \
+    grep -vE ':(5353|1716|4713|32000|32768|49152)' | \
+    grep -viE 'kdeconnect|avahi|mdns|pulseaudio' || true)
 if [[ -n "$HIGH_PORTS" ]]; then
     add_finding "MEDIUM" "Command and Control" "NET-002" \
         "Listening services on non-standard high ports (>40000)" \
@@ -391,7 +395,12 @@ if [[ -n "$UNEXP_SSH" ]]; then
 fi
 
 # Detection: .bashrc/.profile with suspicious content
-SUSP_RC=$(safe_run grep -r 'base64\|curl\|wget\|nc \|/dev/tcp\|bash -i' /root/.bashrc /root/.bash_profile /etc/profile.d/ /home/*/.bashrc /home/*/.bash_profile 2>/dev/null | head -10 || true)
+# Require actual execution indicators, not just tool names in aliases or config
+# Patterns: piping to shell, /dev/tcp reverse shells, base64-encoded payloads, bash -i
+SUSP_RC=$(safe_run grep -rE \
+    'curl[^|]*\|[[:space:]]*(bash|sh)|wget[^|]*\|[[:space:]]*(bash|sh)|base64[[:space:]]+(-d|-D|--decode)|/dev/tcp/|bash[[:space:]]+-i|exec[[:space:]]+[0-9]+<>' \
+    /root/.bashrc /root/.bash_profile /etc/profile.d/ /home/*/.bashrc /home/*/.bash_profile 2>/dev/null | \
+    grep -v '^[[:space:]]*#' | head -10 || true)
 if [[ -n "$SUSP_RC" ]]; then
     add_finding "HIGH" "Persistence" "PERS-004" \
         "Suspicious code in .bashrc/.profile (possible backdoor)" \
@@ -429,8 +438,8 @@ OS_ID_LIKE=$(safe_run grep '^ID_LIKE=' /etc/os-release 2>/dev/null | cut -d= -f2
 if echo "$OS_ID $OS_ID_LIKE" | grep -qiE 'kali|parrot|blackarch|pentoo'; then
     # On offensive security distros these are expected:
     # kismet capture helpers, chrome-sandbox, polkit-agent, dbus-daemon-launch-helper, mysql auth_pam
-    KNOWN_SUID="${KNOWN_SUID}|kismet_cap|chrome-sandbox|polkit-agent-helper|dbus-daemon-launch-helper|auth_pam_tool|Xorg\.wrap|polkit-agent"
-    SUID_DISTRO_NOTE=" (distro: ${OS_ID} — kismet/chrome/polkit excluded as expected)"
+    KNOWN_SUID="${KNOWN_SUID}|kismet_cap|chrome-sandbox|polkit-agent-helper|dbus-daemon-launch-helper|auth_pam_tool|Xorg\.wrap|polkit-agent|vmware-user-suid-wrapper"
+    SUID_DISTRO_NOTE=" (distro: ${OS_ID} — kismet/chrome/polkit/vmware excluded as expected)"
 else
     SUID_DISTRO_NOTE=""
 fi
@@ -470,6 +479,8 @@ HIDDEN_SUSP=$(safe_run find /tmp /root /home -name '.*' -type f 2>/dev/null | \
     grep -vE '(\.X[0-9]+-lock|\.xfsm-ICE-|\.X[0-9]+\.|\.ICE-unix|\.xsession-errors|vboxclient.*\.pid|parentlock|metadata-v2|remote-settings)' | \
     grep -vE '(node_modules|\.npm|\.gem|\.cargo|\.rustup|\.go|\.m2|\.gradle|eslint|prettier|npmrc|yarnrc)' | \
     grep -vE '(sudo_as_admin_successful|bash_logout|hushlogin|forward|rhosts|netrc|wgetrc|curlrc|inputrc|screenrc|tmux|byobu|pam_environment|wget-hsts|python_history|lesshst|dbshell|rediscli_history|psql_history|mysql_history|sqlite_history)' | \
+    grep -vE '(\.emacs|\.emacs\.d|\.nanorc|\.viminfo|\.selected_editor|\.last-updated|\.bash_logout|\.dir_colors|\.gitconfig|\.gitignore)' | \
+    grep -vE '(plasma|kde|dolphin|konsole|kwin|krunner|kderc|kdeglobals|baloofilerc|startkde|kio|baloo)' | \
     grep -vE 'ZLT' | \
     head -20 || true)
 if [[ -n "$HIDDEN_SUSP" ]]; then
@@ -1282,9 +1293,6 @@ body::before {
       Generated: ${END_TS} &nbsp;|&nbsp;
       Host: ${HOSTNAME_VAL} &nbsp;|&nbsp;
       Duration: ${DURATION}s
-    </p>
-    <p style="margin-top:6px; color: #4a5568">
-      FOR AUTHORIZED DFIR USE ONLY &mdash; Contains sensitive system telemetry
     </p>
   </div>
 </div>
