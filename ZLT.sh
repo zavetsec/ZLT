@@ -30,11 +30,26 @@ for _arg in "$@"; do
         --csv)  EXPORT_CSV=1  ;;
         --json) EXPORT_JSON=1 ;;
         --all)  EXPORT_CSV=1; EXPORT_JSON=1 ;;
-        --help|-h)
-            echo "Usage: $0 [--csv] [--json] [--all]"
-            echo "  --csv    Export findings to CSV alongside HTML report"
-            echo "  --json   Export findings to JSON alongside HTML report"
-            echo "  --all    Export both CSV and JSON"
+        --help|-help|-h)
+            echo ""
+            echo "  ZLT v1.1 — ZavetSec Linux Triage"
+            echo ""
+            echo "  Usage: $0 [OPTIONS]"
+            echo ""
+            echo "  Options:"
+            echo "    --csv      Export findings to CSV alongside HTML report"
+            echo "    --json     Export findings to JSON alongside HTML report"
+            echo "    --all      Export both CSV and JSON"
+            echo "    --help     Show this help message"
+            echo ""
+            echo "  Output files are saved in the same directory as the script."
+            echo ""
+            echo "  Examples:"
+            echo "    sudo ./ZLT.sh                  # HTML report only"
+            echo "    sudo ./ZLT.sh --csv            # HTML + CSV"
+            echo "    sudo ./ZLT.sh --json           # HTML + JSON"
+            echo "    sudo ./ZLT.sh --all            # HTML + CSV + JSON"
+            echo ""
             exit 0 ;;
     esac
 done
@@ -1452,3 +1467,32 @@ echo -e "    xdg-open ${REPORT_FILE}"
 echo -e "    # or copy to your workstation:"
 echo -e "    scp root@\$(hostname):${REPORT_FILE} ./"
 echo ""
+
+# ── Offer HTTP server (useful on Snap-browser environments like Ubuntu 24 Desktop) ──
+if command -v python3 &>/dev/null && [[ -t 0 ]]; then
+    echo -e "  ${CYAN}[?]${NC} ${BOLD}Serve report via local HTTP server?${NC}"
+    echo -e "      ${CYAN}(recommended on Ubuntu Desktop — avoids Snap file:// access issues)${NC}"
+    echo ""
+    printf "      Open in browser at http://localhost:18420 ? [Y/n]: "
+    read -r _SERVE_ANS
+    _SERVE_ANS="${_SERVE_ANS:-Y}"
+    if [[ "$_SERVE_ANS" =~ ^[Yy]$ ]]; then
+        _SERVE_PORT=18420
+        _SERVE_URL="http://localhost:${_SERVE_PORT}/$(basename "$REPORT_FILE")"
+        echo ""
+        log_ok "Starting HTTP server on port ${_SERVE_PORT}..."
+        log_info "Open: ${_SERVE_URL}"
+        echo ""
+        # Try to open browser automatically
+        if command -v xdg-open &>/dev/null; then
+            (sleep 1 && xdg-open "$_SERVE_URL") &
+        fi
+        log_info "Press Ctrl+C to stop the server."
+        echo ""
+        cd "$(dirname "$REPORT_FILE")" && python3 -m http.server "$_SERVE_PORT" --bind 127.0.0.1
+    else
+        echo ""
+        log_info "Skipped. Open manually: xdg-open ${REPORT_FILE}"
+        echo ""
+    fi
+fi
