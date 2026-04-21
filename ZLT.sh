@@ -303,7 +303,6 @@ _triage_write "03_network" "ss_listening.txt"    "$M_NETSTAT"
 _triage_write "03_network" "ss_established.txt"  "$M_ESTABLISHED"
 _triage_write "03_network" "interfaces.txt"      "$M_INTERFACES"
 _triage_write "03_network" "routes.txt"          "$M_ROUTES"
-_triage_write "03_network" "arp.txt"             "$M_ARP"
 
 # =============================================================================
 # MODULE 4: Running Processes
