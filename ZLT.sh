@@ -1491,53 +1491,71 @@ if command -v python3 &>/dev/null && [[ -t 0 ]]; then
         echo ""
 
         # ── Open browser as the real (non-root) user ──────────────────────────
-        # Ubuntu 24 Desktop uses Wayland + Snap Firefox. Running via sudo means
-        # we have no DISPLAY/WAYLAND_DISPLAY/DBUS — must harvest them from the
-        # user's live processes in /proc or via loginctl.
+        # Ubuntu 24 Desktop: Firefox is a Snap — xdg-open doesn't find it via
+        # normal PATH. We must locate the browser binary directly and pass the
+        # correct Wayland/X11/DBUS session env vars harvested from /proc.
         _REAL_USER="${SUDO_USER:-}"
         (
             sleep 1
             if [[ -n "$_REAL_USER" ]] && id "$_REAL_USER" &>/dev/null; then
                 _REAL_UID=$(id -u "$_REAL_USER")
 
-                # Scan /proc for any process owned by the real user and extract
-                # session environment variables — works on both X11 and Wayland.
-                _ENV_DISPLAY=""
-                _ENV_WAYLAND=""
-                _ENV_DBUS=""
-                _ENV_XDG_RT=""
+                # Step 1: harvest session env vars from user's live /proc entries
+                _ENV_DISPLAY="" _ENV_WAYLAND="" _ENV_DBUS="" _ENV_XDG_RT=""
                 for _pid_env in /proc/*/environ; do
                     [[ -r "$_pid_env" ]] || continue
-                    _pid_uid=$(stat -c '%u' "$_pid_env" 2>/dev/null || echo "0")
-                    [[ "$_pid_uid" != "$_REAL_UID" ]] && continue
-                    _env_content=$(tr '\0' '\n' < "$_pid_env" 2>/dev/null) || continue
-                    [[ -z "$_ENV_DISPLAY" ]] && _ENV_DISPLAY=$(echo "$_env_content" | grep '^DISPLAY='                  | head -1 | cut -d= -f2-)
-                    [[ -z "$_ENV_WAYLAND" ]] && _ENV_WAYLAND=$(echo "$_env_content" | grep '^WAYLAND_DISPLAY='          | head -1 | cut -d= -f2-)
-                    [[ -z "$_ENV_DBUS"    ]] && _ENV_DBUS=$(echo    "$_env_content" | grep '^DBUS_SESSION_BUS_ADDRESS=' | head -1 | cut -d= -f2-)
-                    [[ -z "$_ENV_XDG_RT"  ]] && _ENV_XDG_RT=$(echo  "$_env_content" | grep '^XDG_RUNTIME_DIR='         | head -1 | cut -d= -f2-)
+                    [[ "$(stat -c '%u' "$_pid_env" 2>/dev/null)" != "$_REAL_UID" ]] && continue
+                    _ec=$(tr '\0' '\n' < "$_pid_env" 2>/dev/null) || continue
+                    [[ -z "$_ENV_DISPLAY" ]] && _ENV_DISPLAY=$(echo "$_ec" | grep '^DISPLAY='                  | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_WAYLAND" ]] && _ENV_WAYLAND=$(echo "$_ec" | grep '^WAYLAND_DISPLAY='          | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_DBUS"    ]] && _ENV_DBUS=$(echo    "$_ec" | grep '^DBUS_SESSION_BUS_ADDRESS=' | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_XDG_RT"  ]] && _ENV_XDG_RT=$(echo  "$_ec" | grep '^XDG_RUNTIME_DIR='         | head -1 | cut -d= -f2-)
                     [[ -n "$_ENV_DBUS" ]] && { [[ -n "$_ENV_DISPLAY" ]] || [[ -n "$_ENV_WAYLAND" ]]; } && break
                 done
 
+                # Step 2: find a browser binary — prioritise Snap Firefox,
+                # then common non-Snap browsers
+                _BROWSER=""
+                for _b in \
+                    "/snap/bin/firefox" \
+                    "/usr/bin/firefox" \
+                    "/snap/bin/chromium" \
+                    "/usr/bin/chromium-browser" \
+                    "/usr/bin/chromium" \
+                    "/usr/bin/google-chrome" \
+                    "/usr/bin/google-chrome-stable"
+                do
+                    if [[ -x "$_b" ]]; then
+                        _BROWSER="$_b"
+                        break
+                    fi
+                done
+
+                # Step 3: build env array and launch
                 _OPEN_ENV=()
                 [[ -n "$_ENV_DISPLAY" ]] && _OPEN_ENV+=("DISPLAY=$_ENV_DISPLAY")
                 [[ -n "$_ENV_WAYLAND" ]] && _OPEN_ENV+=("WAYLAND_DISPLAY=$_ENV_WAYLAND")
                 [[ -n "$_ENV_DBUS"    ]] && _OPEN_ENV+=("DBUS_SESSION_BUS_ADDRESS=$_ENV_DBUS")
                 [[ -n "$_ENV_XDG_RT"  ]] && _OPEN_ENV+=("XDG_RUNTIME_DIR=$_ENV_XDG_RT")
+                # Snap Firefox needs HOME to find its profile
+                _OPEN_ENV+=("HOME=/home/${_REAL_USER}")
 
-                if [[ "${#_OPEN_ENV[@]}" -gt 0 ]]; then
-                    sudo -u "$_REAL_USER" "${_OPEN_ENV[@]}" xdg-open "$_SERVE_URL" 2>/dev/null
-                else
-                    # Fallback: try loginctl + sensible defaults
-                    _SESSION_ID=$(loginctl list-sessions --no-legend 2>/dev/null \
-                        | awk -v u="$_REAL_USER" '$3==u{print $1; exit}')
-                    [[ -n "$_SESSION_ID" ]] && loginctl activate "$_SESSION_ID" 2>/dev/null || true
+                if [[ -n "$_BROWSER" && "${#_OPEN_ENV[@]}" -gt 0 ]]; then
+                    sudo -u "$_REAL_USER" "${_OPEN_ENV[@]}" "$_BROWSER" "$_SERVE_URL" 2>/dev/null
+                elif [[ -n "$_BROWSER" ]]; then
+                    # env harvest failed — try with runtime dir defaults
                     sudo -u "$_REAL_USER" \
+                        HOME="/home/${_REAL_USER}" \
                         DISPLAY=":0" \
                         WAYLAND_DISPLAY="wayland-0" \
                         XDG_RUNTIME_DIR="/run/user/${_REAL_UID}" \
-                        xdg-open "$_SERVE_URL" 2>/dev/null
+                        "$_BROWSER" "$_SERVE_URL" 2>/dev/null
+                else
+                    # No known browser found — fall back to xdg-open with env
+                    sudo -u "$_REAL_USER" "${_OPEN_ENV[@]}" xdg-open "$_SERVE_URL" 2>/dev/null
                 fi
             else
+                # Not via sudo — run directly
                 xdg-open "$_SERVE_URL" 2>/dev/null
             fi
         ) &>/dev/null &
