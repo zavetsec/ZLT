@@ -78,7 +78,7 @@ echo -e "${BOLD}${GREEN}"
 cat << 'BANNER'
   ______                 _   _____           
  |___  /                | | / ____|          
-    / /  __ ___   ___  _| || (___   ___  ___ 
+    / /  __ ___   ____ _| || (___   ___  ___ 
    / /  / _` \ \ / / _ \| __\___ \ / _ \/ __|
   / /__| (_| |\ V /  __/| |_ ____) |  __/ (__ 
  /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
@@ -184,7 +184,9 @@ M_INTERFACES=$(safe_run ip addr 2>/dev/null || ifconfig 2>/dev/null || echo "N/A
 M_ROUTES=$(safe_run ip route 2>/dev/null || route -n 2>/dev/null || echo "N/A")
 
 # Detection: listening on all interfaces (0.0.0.0)
-WIDE_OPEN=$(echo "$M_NETSTAT" | grep '0\.0\.0\.0:' | grep -v '127\.0\.0\.1' | grep -v '::1' || true)
+# Exclude: loopback addresses including 127.0.0.x%iface variants (systemd-resolved)
+WIDE_OPEN=$(echo "$M_NETSTAT" | grep '0\.0\.0\.0:' | \
+    grep -v '127\.0\.0\.' | grep -v '::1' || true)
 if [[ -n "$WIDE_OPEN" ]]; then
     PORTS_LIST=$(echo "$WIDE_OPEN" | awk '{print $5}' | tr '\n' ' ' | head -c 300)
     add_finding "LOW" "Discovery" "NET-001" \
@@ -197,7 +199,7 @@ fi
 # Avahi (5353), and common ephemeral KDE/GNOME service ports
 HIGH_PORTS=$(echo "$M_NETSTAT" | grep -E ':([4-9][0-9]{4}|[1-9][0-9]{4})' | grep '0\.0\.0\.0\|:::' | \
     grep -vE ':(5353|1716|4713|32000|32768|49152)' | \
-    grep -viE 'kdeconnect|avahi|mdns|pulseaudio' || true)
+    grep -viE 'kdeconnect|avahi|mdns|pulseaudio|systemd-timesyn|timesyncd' || true)
 if [[ -n "$HIGH_PORTS" ]]; then
     add_finding "MEDIUM" "Command and Control" "NET-002" \
         "Listening services on non-standard high ports (>40000)" \
@@ -283,6 +285,7 @@ if command -v dpkg &>/dev/null || command -v rpm &>/dev/null; then
         grep -vE '^\[|^\s*$|\(deleted\)' | \
         grep -E '^/(usr|bin|sbin|opt|srv|app|var/lib|var/opt|usr/local)' | \
         grep -vE '^/(usr/lib/(snapd|flatpak)|opt/(snap|homebrew))' | \
+        grep -vE '/(fusermount3?|mount\.fuse|snap|flatpak-spawn|bwrap)$' | \
         sort -u > "$_UNPACK_TMP" 2>/dev/null || true
 
     # Step 2: for each unique binary, check package ownership
@@ -481,6 +484,8 @@ HIDDEN_SUSP=$(safe_run find /tmp /root /home -name '.*' -type f 2>/dev/null | \
     grep -vE '(sudo_as_admin_successful|bash_logout|hushlogin|forward|rhosts|netrc|wgetrc|curlrc|inputrc|screenrc|tmux|byobu|pam_environment|wget-hsts|python_history|lesshst|dbshell|rediscli_history|psql_history|mysql_history|sqlite_history)' | \
     grep -vE '(\.emacs|\.emacs\.d|\.nanorc|\.viminfo|\.selected_editor|\.last-updated|\.bash_logout|\.dir_colors|\.gitconfig|\.gitignore)' | \
     grep -vE '(plasma|kde|dolphin|konsole|kwin|krunner|kderc|kdeglobals|baloofilerc|startkde|kio|baloo)' | \
+    grep -vE '(/snap/|\.last_revision|\.snapshots|snapd|\.gnome|\.gtk|\.dbus|\.local/share/recently|\.local/share/gnome)' | \
+    grep -vE '(\.ICEauthority|\.Xauthority|\.xsession|\.fonts|\.icons|\.themes|\.compiz|\.gconf|\.pulse|\.config/pulse)' | \
     grep -vE 'ZLT' | \
     head -20 || true)
 if [[ -n "$HIDDEN_SUSP" ]]; then
@@ -579,7 +584,9 @@ M_RESOLV=$(safe_run cat /etc/resolv.conf 2>/dev/null | head -20)
 M_ARP=$(safe_run arp -a 2>/dev/null || ip neigh 2>/dev/null | head -30 || echo "N/A")
 
 # Detection: /etc/hosts hijacking
-HOSTS_SUSP=$(safe_run grep -v '^#\|^$\|^127\.\|^::1\|^ff' /etc/hosts 2>/dev/null | head -20 || true)
+# Exclude: standard loopback (127./::1/ff), standard IPv6 multicast/anycast defaults
+# fe00::0 ip6-localnet, ff02::1 ip6-allnodes etc. are in Ubuntu's default /etc/hosts template
+HOSTS_SUSP=$(safe_run grep -v '^#\|^$\|^127\.\|^::1\|^ff\|^fe00::0\|^fe80::' /etc/hosts 2>/dev/null | head -20 || true)
 if [[ -n "$HOSTS_SUSP" ]]; then
     add_finding "MEDIUM" "Defense Evasion" "NET-004" \
         "Non-standard entries in /etc/hosts (possible DNS hijacking)" \
