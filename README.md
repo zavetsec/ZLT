@@ -43,7 +43,7 @@ scp root@TARGET:/tmp/ZLT_*.html ./
 
 > **Without root** the script still runs, but some modules (shadow hashes, `/proc/*/exe`, journald) will return incomplete data.
 
-<img width="1453" height="773" alt="image" src="https://github.com/user-attachments/assets/8ff27144-a095-4773-9cec-bbb6e1ca8bdd" />
+<img width="1403" height="832" alt="image" src="https://github.com/user-attachments/assets/7850af2e-6bd4-40cf-90a9-c0db2cc53b86" />
 
 ---
 
