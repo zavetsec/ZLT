@@ -43,6 +43,8 @@ scp root@TARGET:/tmp/ZLT_*.html ./
 
 > **Without root** the script still runs, but some modules (shadow hashes, `/proc/*/exe`, journald) will return incomplete data.
 
+<img width="1453" height="773" alt="image" src="https://github.com/user-attachments/assets/8ff27144-a095-4773-9cec-bbb6e1ca8bdd" />
+
 ---
 
 ## Telemetry Modules
@@ -61,6 +63,8 @@ scp root@TARGET:/tmp/ZLT_*.html ./
 | 10 | **Kernel Modules** | lsmod, non-standard .ko files |
 | 11 | **Shell & History** | Environment variables, bash/zsh/fish history (root + all users) |
 | 12 | **Container / Cloud** | Docker/LXC detection, AWS/GCP/Azure metadata, virtualisation type |
+
+<img width="1406" height="888" alt="image" src="https://github.com/user-attachments/assets/35cec552-eae3-45e8-89b9-ae2f4eca91b8" />
 
 ---
 
