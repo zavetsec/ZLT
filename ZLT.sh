@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ZLT — ZavetSec Linux Triage v1.0
+# ZLT — ZavetSec Linux Triage v1.1
 # DFIR telemetry collection + built-in detection rules
 # Requires: bash 4+, root/sudo recommended
-# Output: self-contained HTML report
+# Output: self-contained HTML report (+ optional CSV/JSON export)
+# Usage: ./ZLT.sh [--csv] [--json] [--all]
 # =============================================================================
 
 set -uo pipefail
 IFS=$'\n\t'
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TOOL_VERSION="1.0"
+TOOL_VERSION="1.1"
 TOOL_NAME="ZLT"
 HOSTNAME_VAL=$(hostname 2>/dev/null || echo "unknown")
 START_TS=$(date '+%Y-%m-%d %H:%M:%S')
 START_EPOCH=$(date +%s)
-REPORT_FILE="/tmp/ZLT_${HOSTNAME_VAL}_$(date +%Y%m%d_%H%M%S).html"
+
+# Resolve script directory (works with symlinks, relative paths, direct execution)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPORT_BASE="${SCRIPT_DIR}/ZLT_${HOSTNAME_VAL}_$(date +%Y%m%d_%H%M%S)"
+REPORT_FILE="${REPORT_BASE}.html"
+
+# ── Export flags (CLI args) ───────────────────────────────────────────────────
+EXPORT_CSV=0
+EXPORT_JSON=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --csv)  EXPORT_CSV=1  ;;
+        --json) EXPORT_JSON=1 ;;
+        --all)  EXPORT_CSV=1; EXPORT_JSON=1 ;;
+        --help|-h)
+            echo "Usage: $0 [--csv] [--json] [--all]"
+            echo "  --csv    Export findings to CSV alongside HTML report"
+            echo "  --json   Export findings to JSON alongside HTML report"
+            echo "  --all    Export both CSV and JSON"
+            exit 0 ;;
+    esac
+done
 
 # Colors for terminal
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -83,13 +105,15 @@ cat << 'BANNER'
   / /__| (_| |\ V /  __/| |_ ____) |  __/ (__ 
  /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
                                                 
- ZLT v1.0 | ZavetSec Linux Triage | DFIR Telemetry + Detection
+ ZLT v1.1 | ZavetSec Linux Triage | DFIR Telemetry + Detection
 BANNER
 echo -e "${NC}"
 
 log_info "Target: ${HOSTNAME_VAL}"
 log_info "Start:  ${START_TS}"
 log_info "Output: ${REPORT_FILE}"
+[[ "$EXPORT_CSV"  -eq 1 ]] && log_info "Export: ${REPORT_BASE}.csv"
+[[ "$EXPORT_JSON" -eq 1 ]] && log_info "Export: ${REPORT_BASE}.json"
 echo ""
 
 # =============================================================================
@@ -1342,6 +1366,73 @@ HTMLEOF
 # =============================================================================
 # DONE
 # =============================================================================
+
+# ── Optional: CSV export ──────────────────────────────────────────────────────
+if [[ "$EXPORT_CSV" -eq 1 ]]; then
+    CSV_FILE="${REPORT_BASE}.csv"
+    {
+        printf '%s\n' "severity,rule_id,mitre_tactic,title,detail"
+        for _entry in "${FINDINGS_ARR[@]+"${FINDINGS_ARR[@]}"}"; do
+            IFS=$'\x1f' read -r _sev _tactic _rule _title _detail <<< "$_entry"
+            # Escape CSV: wrap fields in double-quotes, double any internal quotes
+            _sev_q="\"${_sev//\"/\"\"}\""
+            _tactic_q="\"${_tactic//\"/\"\"}\""
+            _rule_q="\"${_rule//\"/\"\"}\""
+            _title_q="\"${_title//\"/\"\"}\""
+            _detail_q="\"${_detail//\"/\"\"}\""
+            printf '%s,%s,%s,%s,%s\n' "$_sev_q" "$_rule_q" "$_tactic_q" "$_title_q" "$_detail_q"
+        done
+    } > "$CSV_FILE"
+    log_ok "CSV exported: ${CSV_FILE}"
+fi
+
+# ── Optional: JSON export ─────────────────────────────────────────────────────
+if [[ "$EXPORT_JSON" -eq 1 ]]; then
+    JSON_FILE="${REPORT_BASE}.json"
+    json_escape() {
+        local s="$*"
+        s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"
+        s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+        printf '%s' "$s"
+    }
+    {
+        printf '{\n'
+        printf '  "tool": "ZLT",\n'
+        printf '  "version": "%s",\n' "$(json_escape "$TOOL_VERSION")"
+        printf '  "hostname": "%s",\n' "$(json_escape "$HOSTNAME_VAL")"
+        printf '  "scan_start": "%s",\n' "$(json_escape "$START_TS")"
+        printf '  "scan_end": "%s",\n' "$(json_escape "$END_TS")"
+        printf '  "duration_seconds": %s,\n' "$DURATION"
+        printf '  "summary": {\n'
+        printf '    "critical": %d,\n' "$FINDINGS_CRITICAL"
+        printf '    "high": %d,\n' "$FINDINGS_HIGH"
+        printf '    "medium": %d,\n' "$FINDINGS_MEDIUM"
+        printf '    "low": %d,\n' "$FINDINGS_LOW"
+        printf '    "info": %d\n' "$FINDINGS_INFO"
+        printf '  },\n'
+        printf '  "findings": [\n'
+        _total=${#FINDINGS_ARR[@]+"${#FINDINGS_ARR[@]}"}
+        _total="${_total:-0}"
+        _idx=0
+        for _entry in "${FINDINGS_ARR[@]+"${FINDINGS_ARR[@]}"}"; do
+            IFS=$'\x1f' read -r _sev _tactic _rule _title _detail <<< "$_entry"
+            _idx=$((_idx + 1))
+            _comma=','
+            [[ "$_idx" -eq "$_total" ]] && _comma=''
+            printf '    {\n'
+            printf '      "severity": "%s",\n'    "$(json_escape "$_sev")"
+            printf '      "rule_id": "%s",\n'     "$(json_escape "$_rule")"
+            printf '      "mitre_tactic": "%s",\n' "$(json_escape "$_tactic")"
+            printf '      "title": "%s",\n'       "$(json_escape "$_title")"
+            printf '      "detail": "%s"\n'       "$(json_escape "$_detail")"
+            printf '    }%s\n' "$_comma"
+        done
+        printf '  ]\n'
+        printf '}\n'
+    } > "$JSON_FILE"
+    log_ok "JSON exported: ${JSON_FILE}"
+fi
+
 echo ""
 log_ok "Collection complete!"
 echo ""
@@ -1353,6 +1444,8 @@ echo -e "  ${BOLD}Findings:${NC}"
 [[ "$FINDINGS_INFO"     -gt 0 ]] && echo -e "    ${NC}  INFO:     ${FINDINGS_INFO}${NC}"
 echo ""
 echo -e "  ${BOLD}Report:${NC} ${GREEN}${REPORT_FILE}${NC}"
+[[ "$EXPORT_CSV"  -eq 1 ]] && echo -e "  ${BOLD}CSV:${NC}    ${GREEN}${REPORT_BASE}.csv${NC}"
+[[ "$EXPORT_JSON" -eq 1 ]] && echo -e "  ${BOLD}JSON:${NC}   ${GREEN}${REPORT_BASE}.json${NC}"
 echo ""
 echo -e "  ${BOLD}Open:${NC}"
 echo -e "    xdg-open ${REPORT_FILE}"
