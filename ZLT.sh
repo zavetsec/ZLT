@@ -76,9 +76,9 @@ fi
 
 echo -e "${BOLD}${GREEN}"
 cat << 'BANNER'
-  ______                    _   _____           
- |___  /                   | | / ____|          
-    / /  __ ___   _____  _| || (___   ___  ___ 
+  ______                 _   _____           
+ |___  /                | | / ____|          
+    / /  __ ___   ___  _| || (___   ___  ___ 
    / /  / _` \ \ / / _ \| __\___ \ / _ \/ __|
   / /__| (_| |\ V /  __/| |_ ____) |  __/ (__ 
  /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
@@ -263,7 +263,7 @@ fi
 # Skips: kernel threads, interpreters with script args, /tmp /dev/shm (PROC-001),
 #        home directories, known safe unpackaged paths
 # =============================================================================
-log_info "  PROC-005: checking processes vs package database..."
+log_info "PROC-005: checking processes vs package database..."
 M_UNPACKAGED_PROCS=""
 _UNPACK_TMP="/tmp/_zavetsec_unpack_$$"
 _UNPACK_RESULTS="/tmp/_zavetsec_results_$$"
