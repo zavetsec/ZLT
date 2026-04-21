@@ -29,14 +29,18 @@ TRIAGE_DIR="${REPORT_BASE}_triage"
 # ── Export flags (CLI args) ───────────────────────────────────────────────────
 EXPORT_CSV=0
 EXPORT_JSON=0
-EXPORT_TXT=0          # always created; --all also packs it into an archive
+EXPORT_TXT=0
 EXPORT_ARCHIVE=0
+_MENU_USED=0
+
+# ── Parse CLI args ────────────────────────────────────────────────────────────
+_HAS_ARGS=0
 for _arg in "$@"; do
     case "$_arg" in
-        --csv)  EXPORT_CSV=1  ;;
-        --json) EXPORT_JSON=1 ;;
-        --txt)  EXPORT_TXT=1  ;;
-        --all)  EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1; EXPORT_ARCHIVE=1 ;;
+        --csv)  EXPORT_CSV=1; _HAS_ARGS=1 ;;
+        --json) EXPORT_JSON=1; _HAS_ARGS=1 ;;
+        --txt)  EXPORT_TXT=1; _HAS_ARGS=1 ;;
+        --all)  EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1; EXPORT_ARCHIVE=1; _HAS_ARGS=1 ;;
         --help|-help|-h)
             echo ""
             echo "  ZLT v1.2 — ZavetSec Linux Triage"
@@ -53,11 +57,7 @@ for _arg in "$@"; do
             echo "  Output is saved in the same directory as the script."
             echo "  --all creates: .html  .csv  .json  _triage/  .tar.gz"
             echo ""
-            echo "  Examples:"
-            echo "    sudo ./ZLT.sh                  # HTML report only"
-            echo "    sudo ./ZLT.sh --csv            # HTML + CSV"
-            echo "    sudo ./ZLT.sh --txt            # HTML + triage folder"
-            echo "    sudo ./ZLT.sh --all            # everything + archive"
+            echo "  No arguments = interactive menu"
             echo ""
             exit 0 ;;
     esac
@@ -75,10 +75,6 @@ _triage_write() {
     printf '%s
 ' "$*" > "${dir}/${fname}" 2>/dev/null || true
 }
-
-if [[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]]; then
-    mkdir -p "$TRIAGE_DIR" 2>/dev/null || true
-fi
 
 # Colors for terminal
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -152,9 +148,44 @@ echo -e "${NC}"
 
 log_info "Target: ${HOSTNAME_VAL}"
 log_info "Start:  ${START_TS}"
+echo ""
+
+# ── Interactive export menu (shown when no CLI args given and TTY present) ────
+if [[ "$_HAS_ARGS" -eq 0 && -t 0 ]]; then
+    echo -e "  ${BOLD}Select export format:${NC}"
+    echo ""
+    echo -e "  ${CYAN}  1)${NC}  HTML only             ${CYAN}(default)${NC}"
+    echo -e "  ${CYAN}  2)${NC}  HTML + CSV"
+    echo -e "  ${CYAN}  3)${NC}  HTML + JSON"
+    echo -e "  ${CYAN}  4)${NC}  HTML + CSV + JSON"
+    echo -e "  ${CYAN}  5)${NC}  HTML + CSV + JSON + TXT triage folder"
+    echo -e "  ${CYAN}  6)${NC}  ${BOLD}Everything + tar.gz archive${NC}  ${YELLOW}(recommended for IR)${NC}"
+    echo ""
+    printf "  ${BOLD}Your choice [1-6, Enter = 1]:${NC} "
+    read -r _MENU_CHOICE
+    _MENU_CHOICE="${_MENU_CHOICE:-1}"
+    case "$_MENU_CHOICE" in
+        1) ;;
+        2) EXPORT_CSV=1 ;;
+        3) EXPORT_JSON=1 ;;
+        4) EXPORT_CSV=1; EXPORT_JSON=1 ;;
+        5) EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1 ;;
+        6) EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1; EXPORT_ARCHIVE=1 ;;
+        *) log_warn "Unknown choice '${_MENU_CHOICE}', defaulting to HTML only." ;;
+    esac
+    _MENU_USED=1
+    echo ""
+fi
+
+# Init triage dir if needed (must happen after menu selection)
+if [[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]]; then
+    mkdir -p "$TRIAGE_DIR" 2>/dev/null || true
+fi
+
 log_info "Output: ${REPORT_FILE}"
 [[ "$EXPORT_CSV"  -eq 1 ]] && log_info "Export: ${REPORT_BASE}.csv"
 [[ "$EXPORT_JSON" -eq 1 ]] && log_info "Export: ${REPORT_BASE}.json"
+[[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]] && log_info "Triage: ${TRIAGE_DIR}/"
 echo ""
 
 # =============================================================================
