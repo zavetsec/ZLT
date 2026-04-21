@@ -4,7 +4,7 @@
 
 **Agentless DFIR triage for Linux. No dependencies. Single script. Self-contained HTML report.**
 
-[![Version](https://img.shields.io/badge/version-1.0-00ff88?style=flat-square&labelColor=0d1117)](https://github.com/zavetsec/ZLT)
+[![Version](https://img.shields.io/badge/version-1.2-00ff88?style=flat-square&labelColor=0d1117)](https://github.com/zavetsec/ZLT)
 [![Shell](https://img.shields.io/badge/shell-bash%204%2B-00ff88?style=flat-square&labelColor=0d1117)](https://github.com/zavetsec/ZLT)
 [![Rules](https://img.shields.io/badge/detection-high--signal%20ruleset-ff6600?style=flat-square&labelColor=0d1117)](https://github.com/zavetsec/ZLT)
 [![Modules](https://img.shields.io/badge/modules-12-ffaa00?style=flat-square&labelColor=0d1117)](https://github.com/zavetsec/ZLT)
@@ -35,13 +35,28 @@ sha256sum ZLT.sh
 # Run as root
 chmod +x ZLT.sh
 sudo bash ZLT.sh
+# → interactive menu appears: choose export format
 
-# Report is written to /tmp/ZLT_<hostname>_<timestamp>.html
+# Or run non-interactively with flags:
+sudo bash ZLT.sh --csv      # HTML + CSV
+sudo bash ZLT.sh --json     # HTML + JSON
+sudo bash ZLT.sh --txt      # HTML + raw triage folder
+sudo bash ZLT.sh --all      # everything + tar.gz archive
+
+# Report is written to the same directory as ZLT.sh:
+#   ZLT_<hostname>_<timestamp>.html
+#   ZLT_<hostname>_<timestamp>.csv         (--csv / --all)
+#   ZLT_<hostname>_<timestamp>.json        (--json / --all)
+#   ZLT_<hostname>_<timestamp>_triage/     (--txt / --all)
+#   ZLT_<hostname>_<timestamp>.tar.gz      (--all only)
+
 # Copy to your workstation:
-scp root@TARGET:/tmp/ZLT_*.html ./
+scp root@TARGET:~/ZLT_*.html ./
 ```
 
 > **Without root** the script still runs, but some modules (shadow hashes, `/proc/*/exe`, journald) will return incomplete data.
+
+> **Ubuntu 24 Desktop users:** if opening the HTML report in Firefox (Snap) returns "Access denied", select option `6` or run with `--all` and use the built-in HTTP server prompt at the end — the script will offer to serve the report at `http://localhost:18420` automatically.
 
 <img width="1403" height="832" alt="image" src="https://github.com/user-attachments/assets/7850af2e-6bd4-40cf-90a9-c0db2cc53b86" />
 
@@ -203,7 +218,30 @@ All running binaries are owned by installed packages
 
 ---
 
-## HTML Report
+## Output Formats
+
+ZLT supports five output formats, selectable via an **interactive menu** (no args) or **CLI flags**.
+
+### Interactive menu
+
+```
+  Select export format:
+
+    1)  HTML only             (default)
+    2)  HTML + CSV
+    3)  HTML + JSON
+    4)  HTML + CSV + JSON
+    5)  HTML + CSV + JSON + TXT triage folder
+    6)  Everything + tar.gz archive  (recommended for IR)
+
+  Your choice [1-6, Enter = 1]:
+```
+
+All files are saved to the **same directory as the script** — no writes to `/tmp`.
+
+---
+
+### HTML Report
 
 A self-contained HTML file — no external requests, no CDN, works fully offline.
 
@@ -214,6 +252,53 @@ A self-contained HTML file — no external requests, no CDN, works fully offline
 - **System Info** — host overview table and detection rules reference
 
 **Design language:** dark background (`#0d1117`), green accent (`#00ff88`), JetBrains Mono + Rajdhani fonts, color-coded severity badge system, scanline texture overlay.
+
+### CSV Export (`--csv`)
+
+Structured findings table — one row per finding. Columns: `severity`, `rule_id`, `mitre_tactic`, `title`, `detail`. RFC 4180 compliant quoting. Suitable for import into spreadsheets, SOAR playbooks, or log aggregators.
+
+### JSON Export (`--json`)
+
+Full structured document with scan metadata and a `findings` array:
+
+```json
+{
+  "tool": "ZLT", "version": "1.2", "hostname": "...", "scan_start": "...",
+  "duration_seconds": 48,
+  "summary": { "critical": 1, "high": 3, "medium": 2, "low": 0, "info": 1 },
+  "findings": [
+    { "severity": "CRITICAL", "rule_id": "PERS-001", "mitre_tactic": "Persistence",
+      "title": "Suspicious commands in cron", "detail": "..." }
+  ]
+}
+```
+
+### Triage Folder (`--txt`)
+
+Raw text artefacts saved to `ZLT_<host>_<ts>_triage/`, one sub-directory per module:
+
+```
+ZLT_hostname_20260421_1100_triage/
+  01_sysinfo/       os_release.txt · uname.txt · uptime.txt · timezone.txt
+  02_users/         passwd_full.txt · group.txt · uid0.txt · lastlog.txt
+  03_network/       ss_listening.txt · ss_established.txt · interfaces.txt · routes.txt
+  04_processes/     ps_auxf.txt · pstree.txt · fds_open.txt
+  05_persistence/   crontab_root.txt · systemd_running.txt · ssh_authorized_keys.txt · at_jobs.txt
+  06_filesystem/    suid_binaries.txt · world_writable_dirs.txt · hidden_suspicious.txt
+  07_logs/          auth_log.txt · failed_logins.txt · success_logins.txt · dmesg.txt
+  08_netconfig/     iptables.txt · ufw.txt · hosts.txt · resolv_conf.txt
+  09_packages/      installed_packages.txt · recent_packages.txt
+  10_kernel/        lsmod.txt · cmdline.txt
+  11_env_history/   environment.txt · root_history.txt · user_histories.txt · suspicious_cmds.txt
+  12_container/     container_context.txt · cgroup.txt · virt_type.txt
+  findings_summary.txt   ← plain-text findings list
+```
+
+Useful for: passing raw data to other tools, attaching to tickets, archiving without a browser dependency.
+
+### Archive (`--all`)
+
+Packs all of the above — `.html`, `.csv`, `.json`, `_triage/` — into a single `.tar.gz` alongside the script. Ideal for exfil from a compromised host or attaching to an IR case.
 
 ---
 
@@ -237,18 +322,28 @@ A self-contained HTML file — no external requests, no CDN, works fully offline
 ## Architecture
 
 ```
-ZLT.sh  (single-file, ~1350 lines, fully auditable, no external dependencies)
+ZLT.sh  (single-file, ~1750 lines, fully auditable, no external dependencies)
 │
 ├── Helpers
-│   └── safe_run · html_esc · add_finding · telem_section
+│   └── safe_run · html_esc · add_finding · telem_section · _triage_write
+│
+├── Interactive menu / CLI arg parser
+│   └── select output format before collection starts
 │
 ├── Modules 1–12
-│   └── each module: collect telemetry → analyse inline → add_finding()
+│   └── each module: collect telemetry → _triage_write() → analyse inline → add_finding()
 │
-└── HTML Report Builder  (heredoc)
-    ├── Tab: Findings    filterable table, severity badges, MITRE column
-    ├── Tab: Telemetry   raw output in collapsible blocks, 9 sections
-    └── Tab: System Info host details + rules summary table
+├── HTML Report Builder  (heredoc)
+│   ├── Tab: Findings    filterable table, severity badges, MITRE column
+│   ├── Tab: Telemetry   raw output in collapsible blocks, 9 sections
+│   └── Tab: System Info host details + rules summary table
+│
+└── Export stage
+    ├── CSV exporter     RFC 4180, double-quote escaped
+    ├── JSON exporter    structured findings + scan metadata
+    ├── Triage folder    12 sub-dirs, one .txt per data source
+    ├── tar.gz archive   packs all of the above (--all)
+    └── HTTP server      optional localhost:18420 serve (Ubuntu Desktop / Snap browser fix)
 ```
 
 **Delimiter design:** findings are stored in `FINDINGS_ARR[]` using ASCII Unit Separator (`$'\x1f'`, 0x1F) as the field delimiter. This guarantees correct parsing regardless of what characters appear in finding titles or detail text — unlike naive `|||` approaches that break when a pipe character appears in output.
@@ -292,7 +387,7 @@ ZLT is the only tool in this category that is simultaneously agentless, offline-
 The script is designed to be auditable and safe to run in sensitive environments.
 
 - **No data exfiltration.** The script makes no outbound network connections (cloud metadata probes use a 2-second timeout and are clearly labelled in the code).
-- **Read-only collection.** The only file written is the HTML report in `/tmp/`. Nothing else is created, modified, or deleted.
+- **Read-only collection.** Output files are written to the script's own directory. The script creates only what you explicitly select via menu or CLI flags — no temp files are left behind.
 - **No external dependencies.** No curl-to-bash pipelines, no package installs, no Python modules. Pure bash and standard POSIX tools.
 - **Fully auditable.** Single-file, ~1350 lines of plain bash. Read it before you run it — it takes less time than deploying an agent.
 - **Integrity verification.** SHA256 checksums are published with each release. Verify before running on production hosts.
@@ -305,11 +400,13 @@ The script is designed to be auditable and safe to run in sensitive environments
 Alert fires in SIEM
         │
         ▼
-scp ZLT.sh root@TARGET:/tmp/
-ssh root@TARGET "bash /tmp/ZLT.sh"
+scp ZLT.sh root@TARGET:~/
+ssh root@TARGET "sudo bash ~/ZLT.sh --all"
         │
         ▼
-scp root@TARGET:/tmp/ZLT_*.html ./
+scp root@TARGET:~/ZLT_*.tar.gz ./
+        │   (or just the HTML for a quick look)
+scp root@TARGET:~/ZLT_*.html ./
         │
         ▼
 Open report ──► Findings tab ──► filter HIGH / CRITICAL
@@ -352,9 +449,13 @@ All five indicators surfaced in a single triage run. Total time from "something 
 
 ## Roadmap
 
+- [x] **JSON export** — `--json` structured findings with scan metadata for SOAR / log aggregator ingestion
+- [x] **CSV export** — `--csv` findings table for spreadsheets and ticketing systems
+- [x] **Raw triage folder** — `--txt` per-module text artefacts for further tooling
+- [x] **Archive mode** — `--all` packs HTML + CSV + JSON + triage folder into `.tar.gz`
+- [x] **Interactive export menu** — select output format interactively on launch
 - [ ] **Baseline diff mode** — snapshot a clean host state and compare on subsequent runs; flag any deviation in running processes, listening ports, SUID binaries, or cron entries
 - [ ] **Persistence timeline** — correlate cron, systemd units, .bashrc, and authorized_keys modification timestamps into a single ordered view to reconstruct when persistence was established
-- [ ] **JSON output flag** — `--json` mode to emit structured findings for ingestion into SOAR platforms, ticketing systems, or log aggregators
 - [ ] **Remote multi-host mode** — accept a target list and run triage over SSH in parallel, aggregating all reports into a single summary index HTML
 - [ ] **YARA integration** — optional scan of running process memory maps and files in /tmp against a user-supplied YARA ruleset
 
