@@ -744,7 +744,13 @@ M_BASH_HISTORY_USERS=$(
 
 # Detection: suspicious history commands — check both bash and zsh
 SUSP_HIST_FILES="/root/.bash_history /root/.zsh_history"
-SUSP_HIST=$(safe_run cat $SUSP_HIST_FILES 2>/dev/null | strings | grep -iE 'base64|curl.*sh|wget.*sh|chmod.*777|nc -e|/dev/tcp|python.*socket|perl.*socket|bash -i|/tmp/.*\.(sh|py|pl|elf)|dd if=/dev/' | head -20 || true)
+# Use strings if available (binutils), otherwise plain cat — history files are text anyway
+if command -v strings &>/dev/null; then
+    _HIST_READ="strings"
+else
+    _HIST_READ="cat"
+fi
+SUSP_HIST=$(safe_run cat $SUSP_HIST_FILES 2>/dev/null | $_HIST_READ | grep -iE 'base64|curl.*sh|wget.*sh|chmod.*777|nc -e|/dev/tcp|python.*socket|perl.*socket|bash -i|/tmp/.*\.(sh|py|pl|elf)|dd if=/dev/' | head -20 || true)
 if [[ -n "$SUSP_HIST" ]]; then
     add_finding "HIGH" "Execution" "HIST-001" \
         "Suspicious commands found in root bash/zsh history" \
@@ -1485,32 +1491,56 @@ if command -v python3 &>/dev/null && [[ -t 0 ]]; then
         echo ""
 
         # ── Open browser as the real (non-root) user ──────────────────────────
-        # When run via sudo, SUDO_USER contains the original username.
-        # We need their DISPLAY and DBUS session to launch a GUI browser.
+        # Ubuntu 24 Desktop uses Wayland + Snap Firefox. Running via sudo means
+        # we have no DISPLAY/WAYLAND_DISPLAY/DBUS — must harvest them from the
+        # user's live processes in /proc or via loginctl.
         _REAL_USER="${SUDO_USER:-}"
-        if [[ -n "$_REAL_USER" ]] && id "$_REAL_USER" &>/dev/null; then
-            # Find DISPLAY and DBUS_SESSION_BUS_ADDRESS for that user's session
-            _REAL_UID=$(id -u "$_REAL_USER")
-            _REAL_DISPLAY=$(safe_run grep -z DISPLAY \
-                /proc/$(safe_run pgrep -u "$_REAL_UID" -n)/environ 2>/dev/null \
-                | tr '\0' '\n' | grep '^DISPLAY=' | cut -d= -f2 || echo ":0")
-            _REAL_DBUS=$(safe_run grep -z DBUS_SESSION_BUS_ADDRESS \
-                /proc/$(safe_run pgrep -u "$_REAL_UID" -n)/environ 2>/dev/null \
-                | tr '\0' '\n' | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2- || echo "")
-            (
-                sleep 1
-                export DISPLAY="${_REAL_DISPLAY}"
-                [[ -n "$_REAL_DBUS" ]] && export DBUS_SESSION_BUS_ADDRESS="$_REAL_DBUS"
-                sudo -u "$_REAL_USER" \
-                    DISPLAY="$DISPLAY" \
-                    DBUS_SESSION_BUS_ADDRESS="${_REAL_DBUS}" \
-                    xdg-open "$_SERVE_URL" 2>/dev/null
-            ) &
-            log_info "Browser will open as user: ${_REAL_USER}"
-        else
-            # Not running via sudo — try direct xdg-open
-            (sleep 1 && xdg-open "$_SERVE_URL" 2>/dev/null) &
-        fi
+        (
+            sleep 1
+            if [[ -n "$_REAL_USER" ]] && id "$_REAL_USER" &>/dev/null; then
+                _REAL_UID=$(id -u "$_REAL_USER")
+
+                # Scan /proc for any process owned by the real user and extract
+                # session environment variables — works on both X11 and Wayland.
+                _ENV_DISPLAY=""
+                _ENV_WAYLAND=""
+                _ENV_DBUS=""
+                _ENV_XDG_RT=""
+                for _pid_env in /proc/*/environ; do
+                    [[ -r "$_pid_env" ]] || continue
+                    _pid_uid=$(stat -c '%u' "$_pid_env" 2>/dev/null || echo "0")
+                    [[ "$_pid_uid" != "$_REAL_UID" ]] && continue
+                    _env_content=$(tr '\0' '\n' < "$_pid_env" 2>/dev/null) || continue
+                    [[ -z "$_ENV_DISPLAY" ]] && _ENV_DISPLAY=$(echo "$_env_content" | grep '^DISPLAY='                  | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_WAYLAND" ]] && _ENV_WAYLAND=$(echo "$_env_content" | grep '^WAYLAND_DISPLAY='          | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_DBUS"    ]] && _ENV_DBUS=$(echo    "$_env_content" | grep '^DBUS_SESSION_BUS_ADDRESS=' | head -1 | cut -d= -f2-)
+                    [[ -z "$_ENV_XDG_RT"  ]] && _ENV_XDG_RT=$(echo  "$_env_content" | grep '^XDG_RUNTIME_DIR='         | head -1 | cut -d= -f2-)
+                    [[ -n "$_ENV_DBUS" ]] && { [[ -n "$_ENV_DISPLAY" ]] || [[ -n "$_ENV_WAYLAND" ]]; } && break
+                done
+
+                _OPEN_ENV=()
+                [[ -n "$_ENV_DISPLAY" ]] && _OPEN_ENV+=("DISPLAY=$_ENV_DISPLAY")
+                [[ -n "$_ENV_WAYLAND" ]] && _OPEN_ENV+=("WAYLAND_DISPLAY=$_ENV_WAYLAND")
+                [[ -n "$_ENV_DBUS"    ]] && _OPEN_ENV+=("DBUS_SESSION_BUS_ADDRESS=$_ENV_DBUS")
+                [[ -n "$_ENV_XDG_RT"  ]] && _OPEN_ENV+=("XDG_RUNTIME_DIR=$_ENV_XDG_RT")
+
+                if [[ "${#_OPEN_ENV[@]}" -gt 0 ]]; then
+                    sudo -u "$_REAL_USER" "${_OPEN_ENV[@]}" xdg-open "$_SERVE_URL" 2>/dev/null
+                else
+                    # Fallback: try loginctl + sensible defaults
+                    _SESSION_ID=$(loginctl list-sessions --no-legend 2>/dev/null \
+                        | awk -v u="$_REAL_USER" '$3==u{print $1; exit}')
+                    [[ -n "$_SESSION_ID" ]] && loginctl activate "$_SESSION_ID" 2>/dev/null || true
+                    sudo -u "$_REAL_USER" \
+                        DISPLAY=":0" \
+                        WAYLAND_DISPLAY="wayland-0" \
+                        XDG_RUNTIME_DIR="/run/user/${_REAL_UID}" \
+                        xdg-open "$_SERVE_URL" 2>/dev/null
+                fi
+            else
+                xdg-open "$_SERVE_URL" 2>/dev/null
+            fi
+        ) &>/dev/null &
 
         log_info "If browser does not open automatically, navigate to:"
         log_info "  ${_SERVE_URL}"
