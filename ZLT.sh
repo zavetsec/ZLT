@@ -1483,16 +1483,45 @@ if command -v python3 &>/dev/null && [[ -t 0 ]]; then
         log_ok "Starting HTTP server on port ${_SERVE_PORT}..."
         log_info "Open: ${_SERVE_URL}"
         echo ""
-        # Try to open browser automatically
-        if command -v xdg-open &>/dev/null; then
-            (sleep 1 && xdg-open "$_SERVE_URL") &
+
+        # ── Open browser as the real (non-root) user ──────────────────────────
+        # When run via sudo, SUDO_USER contains the original username.
+        # We need their DISPLAY and DBUS session to launch a GUI browser.
+        _REAL_USER="${SUDO_USER:-}"
+        if [[ -n "$_REAL_USER" ]] && id "$_REAL_USER" &>/dev/null; then
+            # Find DISPLAY and DBUS_SESSION_BUS_ADDRESS for that user's session
+            _REAL_UID=$(id -u "$_REAL_USER")
+            _REAL_DISPLAY=$(safe_run grep -z DISPLAY \
+                /proc/$(safe_run pgrep -u "$_REAL_UID" -n)/environ 2>/dev/null \
+                | tr '\0' '\n' | grep '^DISPLAY=' | cut -d= -f2 || echo ":0")
+            _REAL_DBUS=$(safe_run grep -z DBUS_SESSION_BUS_ADDRESS \
+                /proc/$(safe_run pgrep -u "$_REAL_UID" -n)/environ 2>/dev/null \
+                | tr '\0' '\n' | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2- || echo "")
+            (
+                sleep 1
+                export DISPLAY="${_REAL_DISPLAY}"
+                [[ -n "$_REAL_DBUS" ]] && export DBUS_SESSION_BUS_ADDRESS="$_REAL_DBUS"
+                sudo -u "$_REAL_USER" \
+                    DISPLAY="$DISPLAY" \
+                    DBUS_SESSION_BUS_ADDRESS="${_REAL_DBUS}" \
+                    xdg-open "$_SERVE_URL" 2>/dev/null
+            ) &
+            log_info "Browser will open as user: ${_REAL_USER}"
+        else
+            # Not running via sudo — try direct xdg-open
+            (sleep 1 && xdg-open "$_SERVE_URL" 2>/dev/null) &
         fi
+
+        log_info "If browser does not open automatically, navigate to:"
+        log_info "  ${_SERVE_URL}"
+        echo ""
         log_info "Press Ctrl+C to stop the server."
         echo ""
         cd "$(dirname "$REPORT_FILE")" && python3 -m http.server "$_SERVE_PORT" --bind 127.0.0.1
     else
         echo ""
-        log_info "Skipped. Open manually: xdg-open ${REPORT_FILE}"
+        log_info "Skipped. Open manually:"
+        log_info "  xdg-open ${REPORT_FILE}"
         echo ""
     fi
 fi
