@@ -11,7 +11,7 @@ set -uo pipefail
 IFS=$'\n\t'
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TOOL_VERSION="1.2"
+TOOL_VERSION="1.3"
 TOOL_NAME="ZLT"
 HOSTNAME_VAL=$(hostname 2>/dev/null || echo "unknown")
 START_TS=$(date '+%Y-%m-%d %H:%M:%S')
@@ -43,7 +43,7 @@ for _arg in "$@"; do
         --all)  EXPORT_CSV=1; EXPORT_JSON=1; EXPORT_TXT=1; EXPORT_ARCHIVE=1; _HAS_ARGS=1 ;;
         --help|-help|-h)
             echo ""
-            echo "  ZLT v1.2 — ZavetSec Linux Triage"
+            echo "  ZLT v1.3 — ZavetSec Linux Triage"
             echo ""
             echo "  Usage: $0 [OPTIONS]"
             echo ""
@@ -89,6 +89,27 @@ FINDINGS_INFO=0
 
 # ── Storage for findings ─────────────────────────────────────────────────────
 declare -a FINDINGS_ARR=()
+
+# ── Known-good allowlists (suppress recurring false positives) ────────────────
+# v1.3: security/backup agents installed outside dpkg/rpm (own /opt, /var/opt …)
+#       and IR/forensic collectors that legitimately drop executables into /tmp.
+# Tune per environment — these are the agents seen across the ZavetSec estate.
+ZLT_AGENT_PATHS='/opt/(acronis|kaspersky|crowdstrike|CrowdStrike|osquery|velociraptor|qualys|nessus|sentinelone|carbonblack)/|/var/opt/kaspersky/|/var/opt/acronis/|/var/ossec/|/opt/kaspersky/'
+ZLT_AGENT_NAMES='kesl|kesl-control|klnagent|aakore|adp-agent|grpm-sync-unit|task-manager|mms|wazuh|ossec|falcon-sensor|filebeat|auditbeat|metricbeat|packetbeat|osqueryd|velociraptor|qualys-cloud-agent|nessusd|td-agent|sentinel|cbagentd'
+# IR collectors / our own tooling — expected to appear in /tmp during response
+ZLT_IR_TOOLS='Full_collector|_collector|Collection-|uac|UAC|CyLR|velociraptor|linux_audit|ZLT|triage|avml|memdump'
+
+# is_known_agent <string> → return 0 if it matches an agent path/name (benign)
+is_known_agent() {
+    local s="$1"
+    echo "$s" | grep -qiE "$ZLT_AGENT_PATHS" && return 0
+    echo "$s" | grep -qiE "(^|/)($ZLT_AGENT_NAMES)(\$|[^a-zA-Z])" && return 0
+    return 1
+}
+
+# nlines <string> → count of non-empty lines, always a single integer, exit 0.
+# (grep -c prints 0 on no match but exits 1; the naive "|| echo 0" double-prints.)
+nlines() { printf '%s' "$1" | grep -c '.' 2>/dev/null; return 0; }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 log_info()  { echo -e "${CYAN}[*]${NC} $*"; }
@@ -142,7 +163,7 @@ cat << 'BANNER'
   / /__| (_| |\ V /  __/| |_ ____) |  __/ (__ 
  /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
                                                 
- ZLT v1.2 | ZavetSec Linux Triage | DFIR Telemetry + Detection
+ ZLT v1.3 | ZavetSec Linux Triage | DFIR Telemetry + Detection
 BANNER
 echo -e "${NC}"
 
@@ -191,7 +212,7 @@ echo ""
 # =============================================================================
 # MODULE 1: System Info
 # =============================================================================
-log_info "Module 1/12: System Information"
+log_info "Module 1/13: System Information"
 M_SYSINFO=""
 M_SYSINFO+="<tr><td>Hostname</td><td>$(html_esc "$HOSTNAME_VAL")</td></tr>"
 M_SYSINFO+="<tr><td>OS</td><td>$(html_esc "$(safe_run cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')")</td></tr>"
@@ -222,7 +243,7 @@ _triage_write "01_sysinfo" "timezone.txt"    "$(safe_run cat /etc/timezone 2>/de
 # =============================================================================
 # MODULE 2: Users & Accounts
 # =============================================================================
-log_info "Module 2/12: Users & Accounts"
+log_info "Module 2/13: Users & Accounts"
 
 # All users with shell
 M_USERS_SHELL=$(safe_run grep -v '/nologin\|/false' /etc/passwd | head -50)
@@ -238,11 +259,36 @@ M_UID0="$UID0_USERS"
 PASSWD_MTIME=$(safe_run stat -c '%y' /etc/passwd 2>/dev/null | cut -d. -f1)
 
 # Detections
+# USR-001: extra UID 0 account(s). A second root is the #1 thing to check, but in
+# practice it is sometimes a (bad-practice) legitimate admin account — so we flag
+# HIGH (not CRITICAL) and surface the forensic tells that separate a manually
+# inserted backdoor from useradd, then ask the analyst to confirm with the owner.
 if echo "$UID0_USERS" | grep -qv '^root$'; then
     NON_ROOT_UID0=$(echo "$UID0_USERS" | grep -v '^root$' | tr '\n' ' ')
-    add_finding "CRITICAL" "Privilege Escalation" "USR-001" \
-        "Users with UID 0 other than root" \
-        "Accounts with UID=0 detected: ${NON_ROOT_UID0}. Possible backdoor account creation."
+    # Build per-account enrichment
+    EXISTING_USERS=$(safe_run awk -F: '$3!=0{print $1}' /etc/passwd)
+    USR001_DETAIL=""
+    USR001_MIMIC=0
+    while IFS= read -r u; do
+        [[ -z "$u" || "$u" == "root" ]] && continue
+        line=$(safe_run awk -F: -v u="$u" '$1==u{print}' /etc/passwd)
+        home=$(echo "$line" | cut -d: -f6); shell=$(echo "$line" | cut -d: -f7)
+        # Tell #1: no matching group of the same name → not created by useradd (manual /etc/passwd edit)
+        grp_note="no matching group (manual /etc/passwd edit — not useradd)"
+        safe_run getent group "$u" >/dev/null 2>&1 && grp_note="has matching group (consistent with useradd)"
+        # Tell #2: name mimics an existing non-root user (e.g. admin -> admin_ad). Classic masquerade.
+        mimic=""
+        while IFS= read -r e; do
+            [[ -z "$e" ]] && continue
+            if [[ "$u" == "$e"* && "$u" != "$e" ]]; then mimic=" — MIMICS existing user '${e}'"; USR001_MIMIC=1; break; fi
+        done <<< "$EXISTING_USERS"
+        USR001_DETAIL="${USR001_DETAIL}${u} (home=${home}, shell=${shell}, ${grp_note})${mimic}; "
+    done <<< "$(echo "$UID0_USERS" | grep -v '^root$')"
+    # Mimicry of a real admin makes it materially more suspicious — escalate.
+    USR001_SEV="HIGH"; [[ "$USR001_MIMIC" -eq 1 ]] && USR001_SEV="CRITICAL"
+    add_finding "$USR001_SEV" "Privilege Escalation" "USR-001" \
+        "Account(s) with UID 0 other than root" \
+        "UID=0 besides root: ${NON_ROOT_UID0}| ${USR001_DETAIL}ACTION: confirm with the system owner that this account is authorised; if not → backdoor (T1136.001)."
 fi
 
 # Check for new users (created/modified in last 7 days via shadow mtime)
@@ -290,7 +336,7 @@ fi
 # =============================================================================
 # MODULE 3: Network Connections
 # =============================================================================
-log_info "Module 3/12: Network Connections"
+log_info "Module 3/13: Network Connections"
 
 M_NETSTAT=$(safe_run ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null || echo "N/A")
 M_ESTABLISHED=$(safe_run ss -tnp state established 2>/dev/null || netstat -tnp 2>/dev/null | grep ESTABLISHED || echo "N/A")
@@ -329,6 +375,22 @@ if [[ -n "$EXTERNAL_CONNS" ]]; then
         "$(echo "$EXTERNAL_CONNS" | head -5 | tr '\n' '; ')"
 fi
 
+# Detection: sensitive services / Docker-published ports exposed on 0.0.0.0 or ::
+# Databases and admin services should bind to localhost; Docker's docker-proxy
+# publishes container ports straight onto 0.0.0.0 and BYPASSES the host UFW.
+SENSITIVE_EXPOSED=$(echo "$M_NETSTAT" | grep -E '0\.0\.0\.0:|:::|\*:' | \
+    grep -iE 'mysqld|mariadb|postgres|redis|mongod|memcached|elastic|clickhouse|docker-proxy|rpcbind|vnc|rdp|smbd|ipp' | head -20 || true)
+if [[ -n "$SENSITIVE_EXPOSED" ]]; then
+    DOCKER_EXPOSED=$(echo "$SENSITIVE_EXPOSED" | grep -i 'docker-proxy' | head -8 || true)
+    DB_EXPOSED=$(echo "$SENSITIVE_EXPOSED" | grep -ivE 'docker-proxy' | head -8 || true)
+    [[ -n "$DB_EXPOSED" ]] && add_finding "HIGH" "Initial Access" "NET-006" \
+        "Sensitive service (DB/admin) listening on all interfaces" \
+        "Should bind to 127.0.0.1: $(echo "$DB_EXPOSED" | awk '{print $1, $5, $7}' | tr '\n' '; ')"
+    [[ -n "$DOCKER_EXPOSED" ]] && add_finding "MEDIUM" "Initial Access" "NET-007" \
+        "Docker-published port(s) exposed on 0.0.0.0 (bypasses host UFW/iptables)" \
+        "Verify intent / restrict in docker-compose ports mapping: $(echo "$DOCKER_EXPOSED" | awk '{print $5}' | tr '\n' '; ')"
+fi
+
 # ── Triage: network ──────────────────────────────────────────────────────────
 _triage_write "03_network" "ss_listening.txt"    "$M_NETSTAT"
 _triage_write "03_network" "ss_established.txt"  "$M_ESTABLISHED"
@@ -338,7 +400,7 @@ _triage_write "03_network" "routes.txt"          "$M_ROUTES"
 # =============================================================================
 # MODULE 4: Running Processes
 # =============================================================================
-log_info "Module 4/12: Running Processes"
+log_info "Module 4/13: Running Processes"
 
 M_PROCESSES=$(safe_run ps auxf 2>/dev/null | head -100)
 M_PROC_TREE=$(safe_run pstree -p 2>/dev/null | head -80 || echo "pstree not available")
@@ -461,11 +523,34 @@ if command -v dpkg &>/dev/null || command -v rpm &>/dev/null; then
     # Step 3: report findings
     if [[ -s "$_UNPACK_RESULTS" ]]; then
         M_UNPACKAGED_PROCS=$(cat "$_UNPACK_RESULTS")
-        UNPACKAGED_COUNT=$(wc -l < "$_UNPACK_RESULTS")
-        UNPACKAGED_SNIPPET=$(head -5 "$_UNPACK_RESULTS" | tr '\n' '; ')
-        add_finding "HIGH" "Defense Evasion" "PROC-005" \
-            "Processes with binaries not owned by any package — possible implant/malware (${UNPACKAGED_COUNT} found)" \
-            "${UNPACKAGED_SNIPPET}"
+        # v1.3: separate known security/backup agents (benign, just installed outside dpkg)
+        # from genuinely unexpected unpackaged binaries.
+        _UNPACK_REAL=""; _UNPACK_AGENTS=""
+        while IFS= read -r ln; do
+            [[ -z "$ln" ]] && continue
+            binpath="${ln%% |*}"
+            if is_known_agent "$binpath"; then
+                _UNPACK_AGENTS="${_UNPACK_AGENTS}${ln}"$'\n'
+            else
+                _UNPACK_REAL="${_UNPACK_REAL}${ln}"$'\n'
+            fi
+        done < "$_UNPACK_RESULTS"
+
+        if [[ -n "${_UNPACK_REAL//[$'\n\t ']/}" ]]; then
+            UNPACKAGED_COUNT=$(nlines "$_UNPACK_REAL")
+            UNPACKAGED_SNIPPET=$(printf '%s' "$_UNPACK_REAL" | head -5 | tr '\n' '; ')
+            add_finding "HIGH" "Defense Evasion" "PROC-005" \
+                "Processes with binaries not owned by any package — possible implant/malware (${UNPACKAGED_COUNT} found)" \
+                "${UNPACKAGED_SNIPPET}"
+        fi
+        if [[ -n "${_UNPACK_AGENTS//[$'\n\t ']/}" ]]; then
+            AGENT_COUNT=$(nlines "$_UNPACK_AGENTS")
+            add_finding "INFO" "Discovery" "PROC-005b" \
+                "Unpackaged binaries matching known security/backup agents (allowlisted)" \
+                "$(printf '%s' "$_UNPACK_AGENTS" | head -8 | tr '\n' '; ')"
+        fi
+        [[ -z "${_UNPACK_REAL//[$'\n\t ']/}" && -n "${_UNPACK_AGENTS//[$'\n\t ']/}" ]] && \
+            M_UNPACKAGED_PROCS="${M_UNPACKAGED_PROCS}"$'\n'"(all of the above matched the known-agent allowlist)"
     else
         M_UNPACKAGED_PROCS="All running binaries are owned by installed packages"
     fi
@@ -480,7 +565,7 @@ fi
 # =============================================================================
 # MODULE 5: Persistence Mechanisms
 # =============================================================================
-log_info "Module 5/12: Persistence Mechanisms"
+log_info "Module 5/13: Persistence Mechanisms"
 
 # Cron jobs
 M_CRONTAB_ROOT=$(safe_run crontab -l 2>/dev/null || echo "(empty)")
@@ -549,7 +634,7 @@ _triage_write "05_persistence" "at_jobs.txt"        "$(safe_run atq 2>/dev/null 
 # =============================================================================
 # MODULE 6: File System Anomalies
 # =============================================================================
-log_info "Module 6/12: File System Anomalies"
+log_info "Module 6/13: File System Anomalies"
 
 # SUID/SGID binaries
 M_SUID=$(safe_run find / -perm -4000 -type f 2>/dev/null | head -50)
@@ -597,11 +682,21 @@ if [[ -n "$UNKNOWN_SUID" ]]; then
 fi
 
 # Detection: executables in /tmp /dev/shm
-EXEC_IN_TMP=$(safe_run find /tmp /dev/shm /var/tmp -type f -perm /111 2>/dev/null | head -10 || true)
+EXEC_IN_TMP=$(safe_run find /tmp /dev/shm /var/tmp -type f -perm /111 2>/dev/null | head -20 || true)
 if [[ -n "$EXEC_IN_TMP" ]]; then
-    add_finding "HIGH" "Execution" "FS-002" \
-        "Executable files found in /tmp, /dev/shm, /var/tmp" \
-        "$(echo "$EXEC_IN_TMP" | head -10 | tr '\n' '; ')"
+    # v1.3: drop IR collectors / known agents (our own Full_collector etc. are expected during response)
+    EXEC_IN_TMP_REAL=$(echo "$EXEC_IN_TMP" | grep -vE "($ZLT_IR_TOOLS)" | { grep -viE "$ZLT_AGENT_PATHS" || true; } | head -10)
+    EXEC_IN_TMP_AGENT=$(echo "$EXEC_IN_TMP" | grep -E "($ZLT_IR_TOOLS)" | head -10)
+    if [[ -n "${EXEC_IN_TMP_REAL//[$'\n\t ']/}" ]]; then
+        add_finding "HIGH" "Execution" "FS-002" \
+            "Executable files found in /tmp, /dev/shm, /var/tmp" \
+            "$(echo "$EXEC_IN_TMP_REAL" | head -10 | tr '\n' '; ')"
+    fi
+    if [[ -n "${EXEC_IN_TMP_AGENT//[$'\n\t ']/}" ]]; then
+        add_finding "INFO" "Execution" "FS-002b" \
+            "Executables in /tmp matching IR/forensic collectors (allowlisted — likely your own response tooling)" \
+            "$(echo "$EXEC_IN_TMP_AGENT" | head -5 | tr '\n' '; ')"
+    fi
 fi
 
 # Detection: recently modified system binaries (executables only, not configs)
@@ -641,7 +736,7 @@ _triage_write "06_filesystem" "hidden_suspicious.txt"   "$HIDDEN_SUSP"
 # =============================================================================
 # MODULE 7: Log Analysis
 # =============================================================================
-log_info "Module 7/12: Log Analysis"
+log_info "Module 7/13: Log Analysis"
 
 # Auth log — try file first, fall back to journald
 M_AUTH_TAIL=""
@@ -691,7 +786,7 @@ fi
 M_LAST_LOGINS=$(safe_run last -n 30 2>/dev/null | head -30 || echo "N/A")
 
 # Detection: brute force (>20 failed attempts)
-BRUTE_COUNT=$(echo "$FAILED_LOGINS" | grep -c '.' || echo "0")
+BRUTE_COUNT=$(nlines "$FAILED_LOGINS")
 if [[ "$BRUTE_COUNT" -gt 20 ]]; then
     TOP_ATTACKER=$(echo "$FAILED_LOGINS" | grep -oE 'from [0-9.]+' | sort | uniq -c | sort -rn | head -3 | tr '\n' '; ' || true)
     add_finding "HIGH" "Credential Access" "LOG-001" \
@@ -716,6 +811,30 @@ if [[ -n "$SUDO_ROOT" ]]; then
         "$(echo "$SUDO_ROOT" | head -5 | tr '\n' '; ')"
 fi
 
+# v1.3: auditd — collect status and flag if a server has no kernel-level audit trail.
+M_AUDITD="auditd not detected"
+AUDITD_ACTIVE=0
+if command -v auditctl &>/dev/null; then
+    AUD_STATUS=$(safe_run auditctl -s 2>/dev/null)
+    AUD_RULES=$(safe_run auditctl -l 2>/dev/null | head -100)
+    M_AUDITD="=== auditctl -s ===
+${AUD_STATUS}
+
+=== auditctl -l (rules) ===
+${AUD_RULES}"
+    echo "$AUD_STATUS" | grep -qE 'enabled[[:space:]]+[12]' && AUDITD_ACTIVE=1
+    # Quick recent web/exec audit pull for triage (key-agnostic, last 200 events today)
+    if [[ "$IS_ROOT" -eq 1 ]] && command -v ausearch &>/dev/null; then
+        M_AUSEARCH=$(safe_run ausearch -ts today -m execve --input-logs 2>/dev/null | tail -400)
+    fi
+fi
+# auditd absent on a multi-service host is a real visibility gap (we just lived this).
+if [[ "$AUDITD_ACTIVE" -eq 0 && "$IS_ROOT" -eq 1 ]]; then
+    add_finding "LOW" "Defense Evasion" "LOG-004" \
+        "No active kernel audit trail (auditd not enabled)" \
+        "auditd is not running — file/exec forensics for incidents like webroot writes are unavailable. Recommended on servers."
+fi
+
 # ── Triage: logs ─────────────────────────────────────────────────────────────
 _triage_write "07_logs" "auth_log.txt"      "$M_AUTH_TAIL"
 _triage_write "07_logs" "failed_logins.txt" "$FAILED_LOGINS"
@@ -723,11 +842,26 @@ _triage_write "07_logs" "success_logins.txt" "$SUCCESS_LOGINS"
 _triage_write "07_logs" "last_wtmp.txt"     "$M_LAST_LOGINS"
 _triage_write "07_logs" "syslog.txt"        "$M_SYSLOG"
 _triage_write "07_logs" "dmesg.txt"         "$(safe_run dmesg 2>/dev/null | tail -100)"
+_triage_write "07_logs" "auditd_status.txt" "$M_AUDITD"
+[[ -n "${M_AUSEARCH:-}" ]] && _triage_write "07_logs" "auditd_execve_today.txt" "$M_AUSEARCH"
+
+# v1.3: for real IR value, also capture the FULL rotated auth/syslog (not just the
+# 100-line display tail). These are the files that actually contain the intrusion
+# window — the display tail above is for the HTML report only.
+if [[ "$IS_ROOT" -eq 1 ]]; then
+    _triage_write "07_logs" "auth_log_full.txt" \
+        "$(safe_run cat /var/log/auth.log /var/log/secure 2>/dev/null; \
+           for f in /var/log/auth.log.[0-9] /var/log/secure-[0-9]*; do safe_run zcat -f "$f" 2>/dev/null; done)"
+    _triage_write "07_logs" "syslog_full.txt" \
+        "$(safe_run cat /var/log/syslog /var/log/messages 2>/dev/null; \
+           for f in /var/log/syslog.[0-9] /var/log/messages-[0-9]*; do safe_run zcat -f "$f" 2>/dev/null; done)"
+    _triage_write "07_logs" "btmp_failed.txt" "$(safe_run lastb -n 200 2>/dev/null)"
+fi
 
 # =============================================================================
 # MODULE 8: Network Config & Firewall
 # =============================================================================
-log_info "Module 8/12: Network Config & Firewall"
+log_info "Module 8/13: Network Config & Firewall"
 
 M_IPTABLES=$(safe_run iptables -L -n 2>/dev/null | head -60 || safe_run nft list ruleset 2>/dev/null | head -60 || echo "N/A (no iptables/nft access)")
 M_UFW=$(safe_run ufw status verbose 2>/dev/null | head -30 || echo "UFW not installed")
@@ -763,7 +897,7 @@ _triage_write "08_netconfig" "arp_table.txt"  "$M_ARP"
 # =============================================================================
 # MODULE 9: Installed Software & Packages
 # =============================================================================
-log_info "Module 9/12: Installed Packages"
+log_info "Module 9/13: Installed Packages"
 
 if command -v dpkg &>/dev/null; then
     M_PACKAGES=$(safe_run dpkg -l 2>/dev/null | grep '^ii' | awk '{print $2, $3}' | head -100)
@@ -800,7 +934,7 @@ _triage_write "09_packages" "recent_packages.txt"    "$M_RECENT_PKG"
 # =============================================================================
 # MODULE 10: Kernel Modules
 # =============================================================================
-log_info "Module 10/12: Kernel Modules"
+log_info "Module 10/13: Kernel Modules"
 
 M_LSMOD=$(safe_run lsmod 2>/dev/null | head -60 || echo "N/A")
 
@@ -830,7 +964,7 @@ _triage_write "10_kernel" "cmdline.txt"       "$(safe_run cat /proc/cmdline 2>/d
 # =============================================================================
 # MODULE 11: Environment & Shell History
 # =============================================================================
-log_info "Module 11/12: Environment & Shell History"
+log_info "Module 11/13: Environment & Shell History"
 
 M_ENV=$(safe_run env 2>/dev/null | grep -v 'LS_COLORS\|LESS_TERMCAP' | head -40 || echo "N/A")
 
@@ -910,7 +1044,7 @@ _triage_write "11_env_history" "suspicious_cmds.txt"  "$SUSP_HIST"
 # =============================================================================
 # MODULE 12: Container / Cloud Metadata
 # =============================================================================
-log_info "Module 12/12: Container & Cloud Context"
+log_info "Module 12/13: Container & Cloud Context"
 
 M_CONTAINER=""
 IS_CONTAINER=0
@@ -969,9 +1103,38 @@ Azure instance metadata found"
     add_finding "INFO" "Discovery" "CNT-004" "Runtime environment: Azure VM" "Cloud instance metadata retrieved"
 fi
 
+# v1.3: distinguish "this host is INSIDE a container" (above) from "this host RUNS
+# Docker" (a Docker host). The old wording said "no container runtime detected"
+# even on boxes running dozens of containers, which was misleading during triage.
+M_DOCKER="Docker not present"
+DOCKER_HOST=0
+if command -v docker &>/dev/null || [[ -S /var/run/docker.sock ]] || pgrep -x dockerd &>/dev/null; then
+    DOCKER_HOST=1
+    DOCKER_PS=$(safe_run docker ps -a --format '{{.ID}}  {{.Image}}  {{.Status}}  {{.Ports}}  {{.Names}}' 2>/dev/null | head -100)
+    DOCKER_IMG=$(safe_run docker images --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.CreatedSince}}' 2>/dev/null | head -100)
+    [[ -z "$DOCKER_PS" ]] && DOCKER_PS="(docker present but 'docker ps' returned nothing — need root or daemon down)"
+    DOCKER_COUNT=$(nlines "$DOCKER_PS")
+    M_DOCKER="Docker HOST detected — ${DOCKER_COUNT} container record(s)
+
+=== docker ps -a ===
+${DOCKER_PS}
+
+=== docker images ===
+${DOCKER_IMG}"
+    add_finding "INFO" "Discovery" "CNT-005" \
+        "Host runs Docker (${DOCKER_COUNT} container record(s))" \
+        "Docker host — review published ports (NET-007) and image provenance. Containers bypass host firewall."
+fi
+_triage_write "12_container" "docker.txt" "$M_DOCKER"
+
 if [[ -z "$M_CONTAINER" ]]; then
-    M_CONTAINER="Bare metal / VM (no container runtime detected)
+    if [[ "$DOCKER_HOST" -eq 1 ]]; then
+        M_CONTAINER="Host is NOT inside a container, but IS a Docker host (see CNT-005 / docker.txt)
 Virtualisation: ${VIRT_TYPE}"
+    else
+        M_CONTAINER="Bare metal / VM — host is not containerised and no Docker runtime present
+Virtualisation: ${VIRT_TYPE}"
+    fi
 else
     M_CONTAINER="${M_CONTAINER}
 Virtualisation: ${VIRT_TYPE}"
@@ -981,6 +1144,92 @@ fi
 _triage_write "12_container" "container_context.txt" "$M_CONTAINER"
 _triage_write "12_container" "cgroup.txt"    "$(safe_run cat /proc/1/cgroup 2>/dev/null)"
 _triage_write "12_container" "virt_type.txt" "$VIRT_TYPE"
+
+# =============================================================================
+# MODULE 13: Web-host profile (nginx / apache / proftpd / webroot)
+# v1.3 — added after the alb-vm-isp003 defacement case: the host triage was
+# clean but the actual vector lived in webroot + FTP/nginx logs, which the
+# generic modules never captured. This module activates only when a web stack
+# is present, so it stays quiet on non-web hosts.
+# =============================================================================
+WEB_PRESENT=0
+if pgrep -x nginx &>/dev/null || pgrep -x apache2 &>/dev/null || pgrep -x httpd &>/dev/null \
+   || pgrep -x proftpd &>/dev/null || pgrep -x vsftpd &>/dev/null || [[ -d /var/www ]]; then
+    WEB_PRESENT=1
+fi
+
+if [[ "$WEB_PRESENT" -eq 1 ]]; then
+    log_info "Module 13/13: Web-host profile (web stack detected)"
+
+    WEB_DAYS="${ZLT_WEB_DAYS:-7}"   # window for "recently modified" webroot scan
+    # Candidate webroots: plain /var/www plus ISPmanager/cPanel layouts
+    WEB_ROOTS=$(safe_run bash -c 'ls -d /var/www /var/www/*/data/www/* /var/www/*/www/* /home/*/public_html /usr/share/nginx/html 2>/dev/null' | sort -u | head -200)
+
+    # ── Collect web/FTP logs to triage (full, not tailed) ─────────────────────
+    if [[ "$EXPORT_TXT" -eq 1 || "$EXPORT_ARCHIVE" -eq 1 ]]; then
+        for d in /var/log/nginx /var/log/apache2 /var/log/httpd /var/log/proftpd; do
+            [[ -d "$d" ]] || continue
+            sub="13_webhost/$(basename "$d")_logs"
+            for lf in "$d"/*; do
+                [[ -f "$lf" ]] || continue
+                _triage_write "$sub" "$(basename "$lf").txt" "$(safe_run zcat -f "$lf" 2>/dev/null | tail -5000)"
+            done
+        done
+        # ISPmanager per-vhost access/error logs
+        idx=0
+        while IFS= read -r vlog; do
+            [[ -f "$vlog" ]] || continue
+            idx=$((idx+1)); [[ "$idx" -gt 60 ]] && break
+            _triage_write "13_webhost/vhost_logs" "$(echo "$vlog" | tr '/' '_').txt" "$(safe_run tail -3000 "$vlog" 2>/dev/null)"
+        done <<< "$(safe_run bash -c 'ls /var/www/*/logs/*access* /var/www/*/logs/*error* /var/www/*/data/logs/* 2>/dev/null' | head -120)"
+    fi
+
+    # ── Webroot: recently modified files (defacement / dropped shell) ─────────
+    WEB_RECENT=""
+    while IFS= read -r wr; do
+        [[ -z "$wr" || ! -d "$wr" ]] && continue
+        found=$(safe_run find "$wr" -xdev -type f -mtime -"$WEB_DAYS" \
+                  \( -name '*.php' -o -name '*.phtml' -o -name '*.html' -o -name '*.htm' -o -name '*.js' -o -name 'index.*' \) \
+                  -printf '%TY-%Tm-%Td %TT  %s  %p\n' 2>/dev/null | sort | head -400)
+        [[ -n "$found" ]] && WEB_RECENT="${WEB_RECENT}${found}"$'\n'
+    done <<< "$WEB_ROOTS"
+    _triage_write "13_webhost" "webroot_recent_${WEB_DAYS}d.txt" "${WEB_RECENT:-none}"
+    _triage_write "13_webhost" "webroots.txt" "$WEB_ROOTS"
+
+    WEB_RECENT_COUNT=$(nlines "$WEB_RECENT")
+    if [[ "$WEB_RECENT_COUNT" -gt 0 ]]; then
+        add_finding "MEDIUM" "Defense Evasion" "WEB-001" \
+            "Web content modified within the last ${WEB_DAYS} days (${WEB_RECENT_COUNT} file(s))" \
+            "Possible defacement / web-shell drop. Diff against a known-good backup. Sample: $(printf '%s' "$WEB_RECENT" | tail -6 | tr '\n' '; ')"
+    fi
+
+    # ── Webshell signature scan over recently-modified PHP ────────────────────
+    WEBSHELL_RE='eval[[:space:]]*\(|base64_decode|gzinflate|str_rot13|shell_exec|passthru[[:space:]]*\(|popen[[:space:]]*\(|proc_open|assert[[:space:]]*\(|preg_replace[[:space:]]*\(.*/e|\$_(POST|GET|REQUEST|COOKIE)\[[^]]*\][[:space:]]*\(|FilesMan|b374k|r57|c99|WSOshell|move_uploaded_file'
+    WEBSHELL_HITS=""
+    while IFS= read -r line; do
+        f="${line##*  }"
+        [[ -z "$f" || ! -f "$f" ]] && continue
+        case "$f" in *.php|*.phtml)
+            hit=$(safe_run grep -lEi "$WEBSHELL_RE" "$f" 2>/dev/null)
+            [[ -n "$hit" ]] && WEBSHELL_HITS="${WEBSHELL_HITS}${hit}"$'\n'
+        ;; esac
+    done <<< "$WEB_RECENT"
+    WEBSHELL_HITS=$(printf '%s' "$WEBSHELL_HITS" | grep -v '^$' | sort -u | head -30)
+    _triage_write "13_webhost" "webshell_candidates.txt" "${WEBSHELL_HITS:-none}"
+    if [[ -n "${WEBSHELL_HITS//[$'\n\t ']/}" ]]; then
+        WS_COUNT=$(nlines "$WEBSHELL_HITS")
+        add_finding "HIGH" "Persistence" "WEB-002" \
+            "Recently-modified PHP files matching web-shell signatures (${WS_COUNT})" \
+            "Manually review — eval/base64/system/superglobal-exec patterns: $(printf '%s' "$WEBSHELL_HITS" | head -8 | tr '\n' '; ')"
+    fi
+
+    M_WEBHOST="Web stack detected. Webroots scanned: $(nlines "$WEB_ROOTS")
+Recently modified (<= ${WEB_DAYS}d): ${WEB_RECENT_COUNT} file(s)
+Web-shell signature hits: $(nlines "${WEBSHELL_HITS:-}")
+(Full logs + file lists in 13_webhost/ when --txt/--all used.)"
+else
+    M_WEBHOST="No web stack detected (nginx/apache/proftpd absent, no /var/www) — module skipped."
+fi
 
 # =============================================================================
 # BUILD HTML REPORT
@@ -1448,6 +1697,12 @@ body::before {
 
     <div class="section-header"><span class="section-num">09</span> Container / Cloud</div>
     $(telem_section "cnt-env" "Container / Cloud detection" "$M_CONTAINER")
+    $(telem_section "cnt-docker" "Docker host / containers" "${M_DOCKER:-Docker not present}")
+
+    <div class="section-header"><span class="section-num">10</span> Web-host Profile</div>
+    $(telem_section "web-summary" "Web-host scan summary" "${M_WEBHOST:-not run}")
+    $(telem_section "web-recent"  "Recently modified web content" "${WEB_RECENT:-none}")
+    $(telem_section "web-shells"  "Web-shell signature candidates" "${WEBSHELL_HITS:-none}")
 
   </div>
 
@@ -1462,12 +1717,14 @@ body::before {
     <table class="info-table">
       <tr><td>Category</td><td>Rules</td></tr>
       <tr><td>USR (Users)</td><td>USR-001 — USR-003</td></tr>
-      <tr><td>NET (Network)</td><td>NET-001 — NET-005</td></tr>
-      <tr><td>PROC (Processes)</td><td>PROC-001 — PROC-005</td></tr>
+      <tr><td>NET (Network)</td><td>NET-001 — NET-007</td></tr>
+      <tr><td>PROC (Processes)</td><td>PROC-001 — PROC-005b</td></tr>
       <tr><td>PERS (Persistence)</td><td>PERS-001 — PERS-004</td></tr>
       <tr><td>FS (File System)</td><td>FS-001 — FS-004</td></tr>
-      <tr><td>LOG (Logs)</td><td>LOG-001 — LOG-003</td></tr>
+      <tr><td>LOG (Logs)</td><td>LOG-001 — LOG-004</td></tr>
       <tr><td>NET (Net Config)</td><td>NET-004 — NET-005</td></tr>
+      <tr><td>WEB (Web-host)</td><td>WEB-001 — WEB-002</td></tr>
+      <tr><td>CNT (Container)</td><td>CNT-001 — CNT-005</td></tr>
       <tr><td>PKG (Packages)</td><td>PKG-001</td></tr>
       <tr><td>KRN (Kernel)</td><td>KRN-001 — KRN-002</td></tr>
       <tr><td>HIST (History)</td><td>HIST-001 — HIST-002</td></tr>
@@ -1572,7 +1829,7 @@ if [[ "$EXPORT_JSON" -eq 1 ]]; then
         printf '    "info": %d\n' "$FINDINGS_INFO"
         printf '  },\n'
         printf '  "findings": [\n'
-        _total=${#FINDINGS_ARR[@]+"${#FINDINGS_ARR[@]}"}
+        _total=${#FINDINGS_ARR[@]}
         _total="${_total:-0}"
         _idx=0
         for _entry in "${FINDINGS_ARR[@]+"${FINDINGS_ARR[@]}"}"; do
